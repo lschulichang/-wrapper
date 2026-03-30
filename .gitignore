@@ -1,0 +1,16 @@
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+
+# local envs / caches
+.venv/
+.mypy_cache/
+.pytest_cache/
+
+# generated logs
+*.log
+
+# optional local metadata
+.idea/
+.vscode/
