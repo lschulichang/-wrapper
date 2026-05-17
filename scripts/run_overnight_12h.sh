@@ -44,18 +44,38 @@ while true; do
   RUN_DIR="$("$ROOT/scripts/create_run_dir.sh" "formal_batch_${SCENE_NAME}_iter${ITER}")"
   BATCH_JSON="$RUN_DIR/batch_results.json"
   FIG_DIR="$RUN_DIR/figs"
+  BATCH_CMD=(
+    env -u LD_LIBRARY_PATH python "$ROOT/scripts/run_official_style_batch.py"
+    --config "$CONFIG_PATH"
+    --scene "$SCENE_NAME"
+    --methods "$METHODS"
+    --trials "$TRIALS_PER_METHOD"
+    --seed "$ITER"
+    --keep_traj_limit "$KEEP_TRAJ_LIMIT"
+    --output "$BATCH_JSON"
+  )
+  VIZ_CMD=(
+    env -u LD_LIBRARY_PATH python "$ROOT/scripts/visualize_batch_results.py"
+    --input "$BATCH_JSON"
+    --output_dir "$FIG_DIR"
+  )
+
+  {
+    echo "# generated_at=$(date --iso-8601=seconds)"
+    echo "# run_dir=$RUN_DIR"
+    echo "# cwd=$PWD"
+    printf "BATCH_CMD="
+    printf '%q ' "${BATCH_CMD[@]}"
+    echo
+    printf "VIZ_CMD="
+    printf '%q ' "${VIZ_CMD[@]}"
+    echo
+  } > "$RUN_DIR/cmd.txt"
 
   echo "[overnight] iter=$ITER run_dir=$RUN_DIR"
   echo "[overnight] iter=$ITER running batch..."
 
-  if env -u LD_LIBRARY_PATH python "$ROOT/scripts/run_official_style_batch.py" \
-    --config "$CONFIG_PATH" \
-    --scene "$SCENE_NAME" \
-    --methods "$METHODS" \
-    --trials "$TRIALS_PER_METHOD" \
-    --seed "$ITER" \
-    --keep_traj_limit "$KEEP_TRAJ_LIMIT" \
-    --output "$BATCH_JSON"; then
+  if "${BATCH_CMD[@]}"; then
     echo "[overnight] iter=$ITER batch done"
   else
     echo "[overnight] iter=$ITER batch failed, continue next iter"
@@ -64,9 +84,7 @@ while true; do
   fi
 
   echo "[overnight] iter=$ITER generating figures..."
-  env -u LD_LIBRARY_PATH python "$ROOT/scripts/visualize_batch_results.py" \
-    --input "$BATCH_JSON" \
-    --output_dir "$FIG_DIR" || true
+  "${VIZ_CMD[@]}" || true
 
   echo "[overnight] iter=$ITER finished"
   ITER=$((ITER + 1))
