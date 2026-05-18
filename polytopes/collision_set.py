@@ -6,7 +6,7 @@ import open3d as o3d
 from ellipsoids.mesh_utils import create_gs_mesh
 from ellipsoids.covariance_utils import quaternion_to_rotation_matrix
 from ellipsoids.sphere_utils import fibonacci_ellipsoid
-
+#无用注释
 # This function calculates the bounding box for all line segments, but this is not strictly necessary
 # Since we will probably prune polytopes and so sequential one-at-a-time may be fine as well.
 def compute_bounding_box(path, rs):
