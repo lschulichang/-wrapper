@@ -10,6 +10,7 @@ from polytopes.collision_set import GSplatCollisionSet, ellipsoid_halfspace_inte
 from polytopes.decomposition import compute_polytope
 from ellipsoids.intersection_utils import compute_intersection_linear_motion
 
+
 class SplatPlan():
     def __init__(self, gsplat, robot_config, env_config, spline_planner, device):
         # gsplat: GSplat object
@@ -46,6 +47,48 @@ class SplatPlan():
         self.times_qp = []
         self.times_prune = []
 
+        # Keep failures analyzable in batch experiments by default.
+        self.raise_on_infeasible = False
+
+    def _build_segment_debug_summary(self, segment_debug):
+        created = [row for row in segment_debug if row.get('created_polytope', False)]
+
+        if not created:
+            return {
+                'segment_total': len(segment_debug),
+                'polytope_build_calls': 0,
+                'candidate_count_sum': 0,
+                'candidate_count_mean': 0.0,
+                'candidate_count_max': 0,
+                'candidate_filter_time_sum_sec': 0.0,
+                'candidate_filter_time_mean_sec': 0.0,
+                'exact_hit_sum': 0,
+                'exact_hit_mean': 0.0,
+                'exact_hit_max': 0,
+                'exact_eval_sum': 0,
+                'exact_eval_mean': 0.0,
+            }
+
+        cand = [int(row.get('candidate_count', 0)) for row in created]
+        filt_t = [float(row.get('candidate_filter_time_sec', 0.0)) for row in created]
+        exact_hits = [int(row.get('exact_hit_count', 0)) for row in created]
+        exact_eval = [int(row.get('exact_eval_count', 0)) for row in created]
+
+        return {
+            'segment_total': len(segment_debug),
+            'polytope_build_calls': len(created),
+            'candidate_count_sum': int(np.sum(cand)),
+            'candidate_count_mean': float(np.mean(cand)),
+            'candidate_count_max': int(np.max(cand)),
+            'candidate_filter_time_sum_sec': float(np.sum(filt_t)),
+            'candidate_filter_time_mean_sec': float(np.mean(filt_t)),
+            'exact_hit_sum': int(np.sum(exact_hits)),
+            'exact_hit_mean': float(np.mean(exact_hits)),
+            'exact_hit_max': int(np.max(exact_hits)),
+            'exact_eval_sum': int(np.sum(exact_eval)),
+            'exact_eval_mean': float(np.mean(exact_eval)),
+        }
+
     def generate_path(self, x0, xf):
         # Part 1: Computes the path seed using A*
         tnow = time.time()
@@ -62,37 +105,69 @@ class SplatPlan():
         polytopes = []      # List of polytopes (A, b)
         segments = torch.tensor(np.stack([path[:-1], path[1:]], axis=1), device=self.device)
 
+        segment_debug = []
+
         for it, segment in enumerate(segments):
 
-            # Test if the current segment is in the most recent polytope
             if it > 0:
                 is_in_polytope = compute_segment_in_polytope(polytope[0], polytope[1], segment)
             else:
                 #If we haven't created a polytope yet, so we set it to False.
                 is_in_polytope = False
 
+            should_create_polytope = (it == 0) or (it == len(segments) - 1) or (not is_in_polytope)
+
+            seg_debug = {
+                'segment_idx': int(it),
+                'segment_start': segment[0].detach().cpu().tolist(),
+                'segment_end': segment[1].detach().cpu().tolist(),
+                'segment_length': float(torch.linalg.norm(segment[1] - segment[0]).item()),
+                'created_polytope': bool(should_create_polytope),
+                'contained_in_previous_polytope': bool(is_in_polytope),
+                'candidate_count': 0,
+                'candidate_filter_time_sec': 0.0,
+                'polytope_build_time_sec': 0.0,
+                'exact_eval_count': 0,
+                'exact_hit_count': 0,
+                'polytope_cut_halfspaces': 0,
+                'polytope_total_halfspaces': 0,
+            }
+
             # If this is the first line segment, we always create a polytope. Or subsequently, we only instantiate a polytope if the line segment
-            if (it == 0) or (it == len(segments) - 1) or (not is_in_polytope):
+            if should_create_polytope:
 
                 # Part 2: Computes the collision set
                 tnow = time.time()
                 torch.cuda.synchronize()
-                
+
                 output = self.collision_set.compute_set_one_step(segment)
 
                 torch.cuda.synchronize()
-                times_collision_set += time.time() - tnow
+                filter_time = time.time() - tnow
+                times_collision_set += filter_time
+
+                seg_debug['candidate_filter_time_sec'] = float(filter_time)
+                seg_debug['candidate_count'] = int(output['primitive_ids'].numel())
 
                 # Part 3: Computes the polytope
                 tnow = time.time()
                 torch.cuda.synchronize()
 
-                polytope = self.get_polytope_from_outputs(output)
+                polytope, poly_debug = self.get_polytope_from_outputs(output, return_debug=True)
 
                 torch.cuda.synchronize()
-                times_polytope += time.time() - tnow
+                poly_time = time.time() - tnow
+                times_polytope += poly_time
+
+                seg_debug['polytope_build_time_sec'] = float(poly_time)
+                seg_debug['exact_eval_count'] = int(poly_debug.get('exact_eval_count', 0))
+                seg_debug['exact_hit_count'] = int(poly_debug.get('exact_hit_count', 0))
+                seg_debug['polytope_cut_halfspaces'] = int(poly_debug.get('polytope_cut_halfspaces', 0))
+                seg_debug['polytope_total_halfspaces'] = int(poly_debug.get('polytope_total_halfspaces', 0))
 
                 polytopes.append(polytope)
+
+            segment_debug.append(seg_debug)
 
         # Step 4: Perform Bezier spline optimization
         tnow = time.time()
@@ -102,14 +177,18 @@ class SplatPlan():
         if not feasible:
             traj = torch.stack([x0, xf], dim=0)
 
+            # Persist an infeasible corridor snapshot for debugging.
             self.save_polytope(polytopes, 'infeasible.obj')
-
             print(compute_segment_in_polytope(polytope[0], polytope[1], segments[-1]))
-            raise
+
+            if self.raise_on_infeasible:
+                raise RuntimeError('Spline optimization infeasible')
 
         torch.cuda.synchronize()
         times_opt = time.time() - tnow
-  
+
+        segment_debug_summary = self._build_segment_debug_summary(segment_debug)
+
         # Save outgoing information
         traj_data = {
             'path': path.tolist(),
@@ -120,15 +199,17 @@ class SplatPlan():
             'times_collision_set': times_collision_set,
             'times_polytope': times_polytope,
             'times_opt': times_opt,
-            'feasible': feasible
+            'feasible': feasible,
+            'segment_debug': segment_debug,
+            'segment_debug_summary': segment_debug_summary,
         }
 
         # self.save_polytope(polytopes, 'feasible.obj')
-        
+
         return traj_data
-    
-    def get_polytope_from_outputs(self, data):
-        # For every single line segment, we always create a polytope at the first line segment, 
+
+    def get_polytope_from_outputs(self, data, return_debug=False):
+        # For every single line segment, we always create a polytope at the first line segment,
         # and then we subsequently check if future line segments are within the polytope before creating new ones.
         gs_ids = data['primitive_ids']
 
@@ -139,9 +220,20 @@ class SplatPlan():
 
         midpoint = data['midpoint']
 
+        debug = {
+            'candidate_count': int(gs_ids.numel()),
+            'exact_eval_count': 0,
+            'exact_hit_count': 0,
+            'polytope_cut_halfspaces': 0,
+            'polytope_total_halfspaces': int(A_bb.shape[0]),
+        }
+
         if len(gs_ids) == 0:
-            return (A_bb, b_bb)
-        
+            polytope = (A_bb, b_bb)
+            if return_debug:
+                return polytope, debug
+            return polytope
+
         elif len(gs_ids) == 1:
             rots = data['rots']
             scales = data['scales']
@@ -153,8 +245,8 @@ class SplatPlan():
             means = data['means']
 
         # Perform the intersection test
-        intersection_output = compute_intersection_linear_motion(segment[0], delta_x, rots, scales, means, 
-                                R_B=None, S_B=self.radius, collision_type='sphere', 
+        intersection_output = compute_intersection_linear_motion(segment[0], delta_x, rots, scales, means,
+                                R_B=None, S_B=self.radius, collision_type='sphere',
                                 mode='bisection', N=10)
 
         # With the intersections computed, we can iterate through them and keep a minimal amount of halfspaces
@@ -163,7 +255,7 @@ class SplatPlan():
         b = []
 
         # Loop until we have no more Gaussian intersections.
-        # The idea here is very similar to that done in SFC. For them, they use the Mahalanobis distance to scale their ellipsoid until it 
+        # The idea here is very similar to that done in SFC. For them, they use the Mahalanobis distance to scale their ellipsoid until it
         # reaches the first intersection point, create a halfplane there, segment out the points on the wrong side of the halfplane, and then repeat.
 
         # Instead, we use K_opt as this scaling factor, calculate the halfplane, then inflate the halfplane by the radius of the robot. If the halfplane
@@ -174,6 +266,9 @@ class SplatPlan():
         K_opt = intersection_output['K_opt']
         mu_A = intersection_output['mu_A']
 
+        debug['exact_eval_count'] = int(K_opt.numel())
+        debug['exact_hit_count'] = int((K_opt < 1.0).sum().item())
+
         if K_opt.numel() == 1:
             A_cut, b_cut, _ = compute_polytope(deltas, Q_opt.unsqueeze(0), K_opt.unsqueeze(0), mu_A)
             A.append(A_cut)
@@ -181,13 +276,13 @@ class SplatPlan():
 
         else:
             while len(K_opt) > 0:
-            
+
                 # Find the minimum distance point
                 min_K, min_idx = torch.min(K_opt, dim=0)
 
                 # Compute the halfspace for the min distance ellipsoid
                 A_cut, b_cut, _ = compute_polytope(deltas[min_idx].unsqueeze(0), Q_opt[min_idx].unsqueeze(0), min_K.unsqueeze(0), mu_A[min_idx].unsqueeze(0))
-    
+
                 # Find all ellipsoids that are inside the halfspace. Remember that this halfspace is inflated!
                 A_cut_inflated = A_cut / torch.linalg.norm(A_cut, dim=-1, keepdim=True)
                 b_cut_inflated = b_cut / torch.linalg.norm(A_cut, dim=-1)
@@ -213,6 +308,7 @@ class SplatPlan():
 
         A = torch.stack(A, dim=0).reshape(-1, deltas.shape[-1])
         b = torch.stack(b, dim=0).reshape(-1, )
+        debug['polytope_cut_halfspaces'] = int(A.shape[0])
 
         # The full polytope is a concatenation of the intersection polytope and the bounding box polytope
         A = torch.cat([A, A_bb], dim=0)
@@ -222,7 +318,12 @@ class SplatPlan():
         A = A / norm_A
         b = b / norm_A.squeeze()
 
-        return (A, b)
+        debug['polytope_total_halfspaces'] = int(A.shape[0])
+
+        polytope = (A, b)
+        if return_debug:
+            return polytope, debug
+        return polytope
 
     def save_polytope(self, polytopes, save_path):
         # Initialize mesh object
@@ -243,7 +344,7 @@ class SplatPlan():
             pcd_object.points = o3d.utility.Vector3dVector(qhull_pts)
             bb_mesh, qhull_indices = pcd_object.compute_convex_hull()
             mesh += bb_mesh
-        
+
         success = o3d.io.write_triangle_mesh(save_path, mesh, print_progress=True)
 
         return success
