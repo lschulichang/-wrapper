@@ -1,0 +1,8 @@
+{
+  "scene": "old_union",
+  "frames_total": 29,
+  "success_count": 1,
+  "fallback_count": 28,
+  "detector": "sift",
+  "init_mode": "gt"
+}

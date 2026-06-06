@@ -1,0 +1,14 @@
+data
+outputs
+blender_envs
+configs
+trajs
+*.obj
+*.ply
+*.png
+*.jpg
+*.jpeg
+*.ply
+__pycache__/
+*.pyc
+!*/logo.png
