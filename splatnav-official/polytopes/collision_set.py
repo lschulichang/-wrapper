@@ -31,7 +31,7 @@ def _build_covariance(rots, scales):
     # rots: N x 3 x 3, scales: N x 3 (principal-axis radii)
     scales2 = scales * scales
     return (rots * scales2[:, None, :]) @ rots.transpose(1, 2)
-#无用注释
+#无用注释#
 # This function calculates the bounding box for all line segments, but this is not strictly necessary
 # Since we will probably prune polytopes and so sequential one-at-a-time may be fine as well.
 def compute_bounding_box(path, rs):
