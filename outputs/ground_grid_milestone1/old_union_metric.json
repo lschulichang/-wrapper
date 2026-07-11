@@ -1,0 +1,121 @@
+{
+  "scene": "old_union",
+  "device": "cuda",
+  "start_requested": [
+    0.8149999976158142,
+    0.23000000417232513
+  ],
+  "goal_requested": [
+    -0.5350000262260437,
+    0.23000000417232513
+  ],
+  "start_used": [
+    0.7209999561309814,
+    0.2604999840259552
+  ],
+  "goal_used": [
+    -0.5350000262260437,
+    0.23000000417232513
+  ],
+  "start_was_occupied": true,
+  "goal_was_occupied": false,
+  "start_component": 1,
+  "goal_component": 1,
+  "free_component_count": 15,
+  "largest_free_component_cells": 3470,
+  "path_feasible": true,
+  "path_error": null,
+  "path_points": 171,
+  "path_start": [
+    0.7209999561309814,
+    0.2604999840259552,
+    -0.13826550543308258
+  ],
+  "path_goal": [
+    -0.5389999747276306,
+    0.22649997472763062,
+    -0.13826550543308258
+  ],
+  "all_points_at_reference_z": true,
+  "ground_grid": {
+    "shape": [
+      100,
+      100
+    ],
+    "raw_occupied_cells": 2803,
+    "occupied_cells": 6102,
+    "free_cells": 3898,
+    "occupied_fraction": 0.6101999878883362,
+    "cell_sizes_xy": [
+      0.017999999225139618,
+      0.017000000923871994
+    ],
+    "z_floor": -0.15,
+    "robot_height": 0.023468983627177958,
+    "footprint_radius": 0.03520347544076693,
+    "ground_clearance": 0.004693796725435592,
+    "projection_z_min": -0.1453062032745644,
+    "projection_z_max": -0.12653101637282205,
+    "reference_z": -0.138265508186411,
+    "z_indices": [
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73
+    ]
+  },
+  "raw_occupancy_file": "outputs/ground_grid_milestone1/old_union_metric.raw_occupancy.npy",
+  "occupancy_file": "outputs/ground_grid_milestone1/old_union_metric.occupancy.npy",
+  "path_file": "outputs/ground_grid_milestone1/old_union_metric.path.npy",
+  "comparison_figure": "outputs/ground_grid_milestone1/old_union_metric.png",
+  "scene_preset": {
+    "radius_config": 0.675,
+    "mean_config": [
+      0.14000000059604645,
+      0.23000000417232513,
+      -0.15000000596046448
+    ],
+    "radius": 0.01,
+    "amax": 0.1,
+    "vmax": 0.1,
+    "lower_bound": [
+      -0.8,
+      -0.7,
+      -0.2
+    ],
+    "upper_bound": [
+      1.0,
+      1.0,
+      -0.1
+    ],
+    "resolution": 100
+  },
+  "voxel_bounds_used": {
+    "lower_bound": [
+      -0.800000011920929,
+      -0.699999988079071,
+      -0.20000000298023224
+    ],
+    "upper_bound": [
+      1.0,
+      1.0,
+      -0.10000000149011612
+    ]
+  }
+}

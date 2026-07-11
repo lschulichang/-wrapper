@@ -183,7 +183,10 @@ class PointCloudVoxel(Voxel):
         lib_module = unfoldNd.UnfoldNd(
             kernel_size, dilation=1, padding=padding, stride=1
         )
-        unfolded = lib_module(self.non_navigable_grid.to(dtype=torch.float32)[None, None]).squeeze()     # kernel_size x N x N x N
+        # Remove only the batch dimension. A bare squeeze() also removes the
+        # one-element kernel dimension when radius=0, breaking raw occupancy
+        # generation before the 2D ground-footprint dilation step.
+        unfolded = lib_module(self.non_navigable_grid.to(dtype=torch.float32)[None, None]).squeeze(0)     # kernel_size x N x N x N
         unfolded = unfolded.to(dtype=bool)
 
         # Take the maxpool3d of the binary grid
@@ -331,7 +334,8 @@ class GSplatVoxel(Voxel):
             lib_module = unfoldNd.UnfoldNd(
                 kernel_size, dilation=1, padding=padding, stride=1
             )
-            unfolded = lib_module(self.non_navigable_grid.to(dtype=torch.float32)[None, None]).squeeze()     # kernel_size x N x N x N
+            # Preserve the kernel dimension for the valid radius=0 case.
+            unfolded = lib_module(self.non_navigable_grid.to(dtype=torch.float32)[None, None]).squeeze(0)     # kernel_size x N x N x N
             unfolded = unfolded.to(dtype=bool)
 
             # Take the maxpool3d of the binary grid
