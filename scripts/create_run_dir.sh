@@ -10,8 +10,14 @@ fi
 TOPIC="$1"
 ROOT="/home/howard/Splat-Nav"
 RUNS_DIR="$ROOT/runs"
-TIMESTAMP="$(date +%Y-%m-%d_%H%M)"
-RUN_DIR="$RUNS_DIR/${TIMESTAMP}_${TOPIC}"
+TIMESTAMP="$(date +%Y-%m-%d_%H%M%S)"
+BASE_RUN_DIR="$RUNS_DIR/${TIMESTAMP}_${TOPIC}"
+RUN_DIR="$BASE_RUN_DIR"
+COUNTER=2
+while [[ -e "$RUN_DIR" ]]; do
+  RUN_DIR="${BASE_RUN_DIR}_$(printf '%02d' "$COUNTER")"
+  COUNTER=$((COUNTER + 1))
+done
 UPSTREAM_DIR="$ROOT/splatnav-official"
 if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
   UPSTREAM_DIR="/data/howard/repos/splatnav-official"

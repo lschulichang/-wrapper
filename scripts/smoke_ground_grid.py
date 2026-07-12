@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ sys.path.insert(0, str(UPSTREAM_ROOT))
 
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from initialization.grid_utils import GSplatVoxel  # noqa: E402
+from run_output_utils import resolve_experiment_output  # noqa: E402
 from smoke_splatplan import SCENE_PRESETS, to_serializable  # noqa: E402
 from splat.splat_utils import GSplatLoader  # noqa: E402
 
@@ -37,8 +39,17 @@ def main() -> None:
     parser.add_argument("--ground-clearance-meters", type=float, default=0.0)
     parser.add_argument("--start", nargs=2, type=float, metavar=("X", "Y"))
     parser.add_argument("--goal", nargs=2, type=float, metavar=("X", "Y"))
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path, help="Optional JSON path; existing prefixes are never overwritten")
     args = parser.parse_args()
+
+    output_path, auto_run_dir, redirect_reason = resolve_experiment_output(
+        args.output,
+        PROJECT_ROOT,
+        topic=f"ground_grid_milestone1_{args.scene}",
+    )
+    if redirect_reason is not None:
+        print(f"Output protection: {redirect_reason}")
+        print(f"Allocated new run directory: {auto_run_dir}")
 
     import torch
 
@@ -83,11 +94,11 @@ def main() -> None:
     start = np.asarray(args.start if args.start else preset_center + [radius, 0.0], dtype=np.float32)
     goal = np.asarray(args.goal if args.goal else preset_center - [radius, 0.0], dtype=np.float32)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    raw_occupancy_path = args.output.with_suffix(".raw_occupancy.npy")
-    occupancy_path = args.output.with_suffix(".occupancy.npy")
-    path_file = args.output.with_suffix(".path.npy")
-    figure_file = args.output.with_suffix(".png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_occupancy_path = output_path.with_suffix(".raw_occupancy.npy")
+    occupancy_path = output_path.with_suffix(".occupancy.npy")
+    path_file = output_path.with_suffix(".path.npy")
+    figure_file = output_path.with_suffix(".png")
     np.save(raw_occupancy_path, grid.raw_occupied.detach().cpu().numpy())
     np.save(occupancy_path, grid.occupied.detach().cpu().numpy())
 
@@ -192,8 +203,31 @@ def main() -> None:
             "upper_bound": upper_bound.detach().cpu().tolist(),
         },
     }
-    args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result, indent=2))
+    result_text = json.dumps(result, indent=2)
+    output_path.write_text(result_text, encoding="utf-8")
+    print(result_text)
+
+    if auto_run_dir is not None:
+        verifier = PROJECT_ROOT / "scripts" / "verify_ground_grid_result.py"
+        verification = subprocess.run(
+            [sys.executable, str(verifier), str(output_path)],
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+        )
+        verification_path = auto_run_dir / "assets" / "verification.json"
+        verification_path.write_text(verification.stdout, encoding="utf-8")
+        with (auto_run_dir / "stdout.log").open("a", encoding="utf-8") as stream:
+            stream.write(result_text + "\n" + verification.stdout + verification.stderr)
+        with (auto_run_dir / "notes.md").open("a", encoding="utf-8") as stream:
+            stream.write(f"\n- Output protection: {redirect_reason}.\n")
+            stream.write(f"- Result JSON: {output_path}.\n")
+            stream.write(f"- Verification exit code: {verification.returncode}.\n")
+        print(verification.stdout, end="")
+        print(f"run_dir={auto_run_dir}")
+        print(f"result_json={output_path}")
+        if verification.returncode != 0:
+            raise RuntimeError(f"result verification failed: {verification.stderr}")
 
 
 if __name__ == "__main__":
