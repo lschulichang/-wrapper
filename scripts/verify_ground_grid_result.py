@@ -22,19 +22,19 @@ def main() -> None:
     upper = np.asarray(data["voxel_bounds_used"]["upper_bound"][:2])
     cell_sizes = (upper - lower) / np.asarray(occupancy.shape)
     lower_center = lower + cell_sizes / 2
-    indices = np.rint((path[:, :2] - lower_center) / cell_sizes).astype(np.int64)
+    if path.ndim != 2 or path.shape[1] != 2:
+        raise SystemExit(f"expected a strictly 2D path with shape (N, 2), got {path.shape}")
+    indices = np.rint((path - lower_center) / cell_sizes).astype(np.int64)
 
     collision_points = occupancy[indices[:, 0], indices[:, 1]]
     index_steps = np.abs(np.diff(indices, axis=0))
-    path_length = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1).sum()
+    path_length = np.linalg.norm(np.diff(path, axis=0), axis=1).sum()
     report = {
         "occupancy_shape": list(occupancy.shape),
         "path_shape": list(path.shape),
         "collision_points": int(collision_points.sum()),
         "four_connected": bool(np.all(index_steps.sum(axis=1) == 1)),
-        "fixed_reference_z": bool(
-            np.allclose(path[:, 2], data["ground_grid"]["reference_z"])
-        ),
+        "strictly_2d": True,
         "path_length_scene_units": float(path_length),
         "start_index": indices[0].tolist(),
         "goal_index": indices[-1].tolist(),
@@ -48,8 +48,6 @@ def main() -> None:
         raise SystemExit("path intersects inflated occupancy")
     if not report["four_connected"]:
         raise SystemExit("path contains a non-4-connected step")
-    if not report["fixed_reference_z"]:
-        raise SystemExit("path does not stay at reference_z")
 
 
 if __name__ == "__main__":

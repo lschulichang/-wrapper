@@ -67,14 +67,19 @@ class GroundGridTest(unittest.TestCase):
     def test_path_is_planar_and_collision_free(self) -> None:
         path = self.grid.create_path([0.5, 0.5], [6.5, 0.5])
         self.assertGreater(len(path), 2)
-        np.testing.assert_allclose(path[:, 2], 1.5)
+        self.assertEqual(path.shape[1], 2)
         for point in path:
-            self.assertFalse(self.grid.is_occupied(point[:2]))
+            self.assertFalse(self.grid.is_occupied(point))
         self.assertTrue(np.any(np.isclose(path[:, 1], 3.5)))
 
     def test_occupied_endpoint_can_be_projected(self) -> None:
         projected_path = self.grid.create_path([3.5, 0.5], [6.5, 0.5])
-        self.assertFalse(self.grid.is_occupied(projected_path[0, :2]))
+        self.assertFalse(self.grid.is_occupied(projected_path[0]))
+
+    def test_path_steps_are_strictly_four_connected(self) -> None:
+        path = self.grid.create_path([0.5, 0.5], [6.5, 0.5])
+        indices = np.stack([self.grid.world_to_grid(point).cpu().numpy() for point in path])
+        self.assertTrue(np.all(np.abs(np.diff(indices, axis=0)).sum(axis=1) == 1))
 
     def test_invalid_height_band_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

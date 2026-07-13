@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-import dijkstra3d
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -188,13 +188,7 @@ class GroundGrid:
         start_xy: Sequence[float] | np.ndarray | torch.Tensor,
         goal_xy: Sequence[float] | np.ndarray | torch.Tensor,
     ) -> np.ndarray:
-        """Plan a 4-connected planar path and return an ``N x 3`` world path.
-
-        The returned Z coordinate is the cylinder center
-        ``z_floor + robot_height / 2``. Using a depth-one 3D field with
-        connectivity 6 gives four planar neighbors and reuses Splat-Nav's
-        existing ``dijkstra3d`` dependency.
-        """
+        """Plan directly in the projected plane and return an ``N x 2`` path."""
 
         start = torch.as_tensor(start_xy, dtype=self.xy_centers.dtype, device=self.device).flatten()[:2]
         goal = torch.as_tensor(goal_xy, dtype=self.xy_centers.dtype, device=self.device).flatten()[:2]
@@ -208,33 +202,63 @@ class GroundGrid:
                 raise ValueError("goal lies in an occupied ground-grid cell")
             goal = self.find_closest_navigable(goal)
 
-        source_2d = self.world_to_grid(start).cpu().numpy().astype(np.int32)
-        target_2d = self.world_to_grid(goal).cpu().numpy().astype(np.int32)
-        source = np.array([source_2d[0], source_2d[1], 0], dtype=np.int32)
-        target = np.array([target_2d[0], target_2d[1], 0], dtype=np.int32)
-        field = self.occupied.detach().cpu().numpy()[:, :, None]
-
-        try:
-            indices = dijkstra3d.binary_dijkstra(
-                field,
-                source,
-                target,
-                connectivity=6,
-                background_color=1,
-            )
-        except Exception as exc:
-            raise RuntimeError("no feasible path exists in the projected ground grid") from exc
-
-        if indices is None or len(indices) == 0:
+        source = tuple(int(v) for v in self.world_to_grid(start).cpu().tolist())
+        target = tuple(int(v) for v in self.world_to_grid(goal).cpu().tolist())
+        indices = self._dijkstra_2d(source, target)
+        if len(indices) == 0:
             raise RuntimeError("no feasible path exists in the projected ground grid")
 
         indices = np.asarray(indices, dtype=np.int32)
-        path_xy = self.xy_centers[
+        return self.xy_centers[
             torch.as_tensor(indices[:, 0], device=self.device),
             torch.as_tensor(indices[:, 1], device=self.device),
         ].detach().cpu().numpy()
-        z = np.full((path_xy.shape[0], 1), self.metadata.reference_z, dtype=path_xy.dtype)
-        return np.concatenate([path_xy, z], axis=1)
+
+    def _dijkstra_2d(self, source: tuple[int, int], target: tuple[int, int]) -> list[tuple[int, int]]:
+        """Metric-weighted four-neighbor Dijkstra on the 2D occupancy array."""
+
+        occupied = self.occupied.detach().cpu().numpy()
+        if occupied[source] or occupied[target]:
+            return []
+        distances = np.full(self.shape, np.inf, dtype=np.float64)
+        parents = np.full((*self.shape, 2), -1, dtype=np.int32)
+        distances[source] = 0.0
+        serial = 0
+        queue: list[tuple[float, int, int, int]] = [(0.0, serial, source[0], source[1])]
+        dx, dy = (float(v) for v in self.cell_sizes.detach().cpu().tolist())
+        neighbors = ((1, 0, dx), (0, 1, dy), (-1, 0, dx), (0, -1, dy))
+
+        while queue:
+            cost, _, i, j = heapq.heappop(queue)
+            if cost > distances[i, j] + 1e-12:
+                continue
+            if (i, j) == target:
+                break
+            for di, dj, step_cost in neighbors:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < self.shape[0] and 0 <= nj < self.shape[1]):
+                    continue
+                if occupied[ni, nj]:
+                    continue
+                candidate = cost + step_cost
+                if candidate + 1e-12 < distances[ni, nj]:
+                    distances[ni, nj] = candidate
+                    parents[ni, nj] = (i, j)
+                    serial += 1
+                    heapq.heappush(queue, (candidate, serial, ni, nj))
+
+        if not np.isfinite(distances[target]):
+            return []
+        path = [target]
+        current = target
+        while current != source:
+            parent = parents[current]
+            if parent[0] < 0:
+                return []
+            current = (int(parent[0]), int(parent[1]))
+            path.append(current)
+        path.reverse()
+        return path
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -252,4 +276,5 @@ class GroundGrid:
             "projection_z_max": self.metadata.z_max,
             "reference_z": self.metadata.reference_z,
             "z_indices": list(self.metadata.z_indices),
+            "search_backend": "native_2d_dijkstra_4_connected",
         }

@@ -87,6 +87,7 @@ def main() -> None:
         robot_height=robot_height,
         footprint_radius=footprint_radius,
         ground_clearance=ground_clearance,
+        project_occupied_endpoints=False,
     )
 
     preset_center = np.asarray(preset["mean_config"], dtype=np.float32)[:2]
@@ -113,8 +114,8 @@ def main() -> None:
 
     start_was_occupied = grid.is_occupied(start)
     goal_was_occupied = grid.is_occupied(goal)
-    start_used = grid.find_closest_navigable(start).detach().cpu().numpy() if start_was_occupied else start
-    goal_used = grid.find_closest_navigable(goal).detach().cpu().numpy() if goal_was_occupied else goal
+    start_used = start
+    goal_used = goal
     start_index = grid.world_to_grid(start_used).detach().cpu().numpy()
     goal_index = grid.world_to_grid(goal_used).detach().cpu().numpy()
     start_component = int(component_labels[start_index[0], start_index[1]])
@@ -125,7 +126,7 @@ def main() -> None:
     try:
         path = grid.create_path(start, goal)
         np.save(path_file, path)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         path_error = str(exc)
     extent = [
         float(grid.xy_centers[0, 0, 0].item() - grid.cell_sizes[0].item() / 2),
@@ -189,9 +190,7 @@ def main() -> None:
         "path_points": 0 if path is None else int(len(path)),
         "path_start": None if path is None else path[0].tolist(),
         "path_goal": None if path is None else path[-1].tolist(),
-        "all_points_at_reference_z": False
-        if path is None
-        else bool(np.allclose(path[:, 2], grid.metadata.reference_z)),
+        "path_is_strictly_2d": False if path is None else bool(path.ndim == 2 and path.shape[1] == 2),
         "ground_grid": grid.summary(),
         "raw_occupancy_file": str(raw_occupancy_path),
         "occupancy_file": str(occupancy_path),
