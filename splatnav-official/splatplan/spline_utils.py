@@ -53,13 +53,14 @@ def create_time_pts(deg=8, N_sec=10, tf=1., device='cpu'):
     return data
 
 ### 
-def get_qp_matrices(T, dT, ddT, dddT, ddddT, polytopes, x0, xf, device):
+def get_qp_matrices(T, dT, ddT, dddT, ddddT, polytopes, x0, xf, device, fixed_z=None):
     
     N_sec = len(polytopes)
     deg = T[0].shape[0]
     w = deg*N_sec*3
     k = deg*3
     k3 = deg
+    n_e = 3 * deg
 
     index = torch.arange(deg-1, device=device)
 
@@ -156,6 +157,17 @@ def get_qp_matrices(T, dT, ddT, dddT, ddddT, polytopes, x0, xf, device):
     C = torch.cat([C, C_], dim=0)
 
     d = torch.cat([d, d_], dim=0)
+    if fixed_z is not None:
+        fixed_z = float(fixed_z)
+        C_z = torch.zeros((N_sec * deg, w), dtype=C.dtype, device=device)
+        d_z = torch.full((N_sec * deg,), fixed_z, dtype=d.dtype, device=device)
+        for section in range(N_sec):
+            rows = torch.arange(section * deg, (section + 1) * deg, device=device)
+            z_start = section * 3 * deg + 2 * deg
+            cols = torch.arange(z_start, z_start + deg, device=device)
+            C_z[rows, cols] = 1.0
+        C = torch.cat([C, C_z], dim=0)
+        d = torch.cat([d, d_z], dim=0)
     d = d.reshape((-1,))
 
     return A, b, C, d, Q
@@ -167,6 +179,7 @@ class SplinePlanner():
         self.N_sec = N_sec
         self.device = device
         self.use_cvxpy = use_cvxpy
+        self.last_solver_status = None
 
         ### Create the time points matrix/coefficients for the Bezier curve
         self.time_pts = create_time_pts(deg=spline_deg, N_sec=N_sec, device=device)
@@ -222,11 +235,11 @@ class SplinePlanner():
     #     self.coeffs = np.array(coeffs)
     #     return self.coeffs, prob.value
 
-    def optimize_b_spline(self, polytopes, x0, xf):
-        _, solver_success = self.calculate_b_spline_coeff(polytopes, x0, xf)
+    def optimize_b_spline(self, polytopes, x0, xf, fixed_z=None):
+        _, solver_success = self.calculate_b_spline_coeff(polytopes, x0, xf, fixed_z=fixed_z)
         return self.eval_b_spline(), solver_success
 
-    def calculate_b_spline_coeff(self, polytopes, x0, xf):
+    def calculate_b_spline_coeff(self, polytopes, x0, xf, fixed_z=None):
         N_sections = len(polytopes)         #Number of segments
 
         T = self.time_pts['time_pts']
@@ -243,7 +256,10 @@ class SplinePlanner():
         ddddT_list = [ddddT]*N_sections
 
         #Set up matrices
-        A_prob, b_prob, C_prob, d_prob, Q_prob = get_qp_matrices(T_list, dT_list, ddT_list, dddT_list, ddddT_list, polytopes, x0, xf, self.device)
+        A_prob, b_prob, C_prob, d_prob, Q_prob = get_qp_matrices(
+            T_list, dT_list, ddT_list, dddT_list, ddddT_list,
+            polytopes, x0, xf, self.device, fixed_z=fixed_z
+        )
         n_var = C_prob.shape[-1]
 
         A_prob = A_prob.cpu().numpy()
@@ -263,6 +279,7 @@ class SplinePlanner():
 
             prob = cvx.Problem(objective, constraints)
             prob.solve(solver='ECOS')
+            self.last_solver_status = str(prob.status)
 
             # Check solver status
             if prob.status in ["infeasible", "unbounded"]:
@@ -300,6 +317,7 @@ class SplinePlanner():
             solver = clarabel.DefaultSolver(P, q, A, b, cones, settings)
 
             sol = solver.solve()
+            self.last_solver_status = str(sol.status)
 
             # Check solver status
             if str(sol.status) != 'Solved':

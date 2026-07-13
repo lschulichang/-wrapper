@@ -12,7 +12,7 @@ from ellipsoids.intersection_utils import compute_intersection_linear_motion
 
 
 class SplatPlan():
-    def __init__(self, gsplat, robot_config, env_config, spline_planner, device):
+    def __init__(self, gsplat, robot_config, env_config, spline_planner, device, seed_planner=None, collision_set=None):
         # gsplat: GSplat object
 
         self.gsplat = gsplat
@@ -22,18 +22,23 @@ class SplatPlan():
         self.radius = robot_config['radius']
         self.vmax = robot_config['vmax']
         self.amax = robot_config['amax']
-        self.collision_set = GSplatCollisionSet(self.gsplat, self.vmax, self.amax, self.radius, self.device)
+        self.collision_set = collision_set or GSplatCollisionSet(self.gsplat, self.vmax, self.amax, self.radius, self.device)
 
         # Environment configuration (specifically voxel)
         self.lower_bound = env_config['lower_bound']
         self.upper_bound = env_config['upper_bound']
         self.resolution = env_config['resolution']
 
-        tnow = time.time()
-        torch.cuda.synchronize()
-        self.gsplat_voxel = GSplatVoxel(self.gsplat, lower_bound=self.lower_bound, upper_bound=self.upper_bound, resolution=self.resolution, radius=self.radius, device=device)
-        torch.cuda.synchronize()
-        print('Time to create GSplatVoxel:', time.time() - tnow)
+        self.gsplat_voxel = None
+        if seed_planner is None:
+            tnow = time.time()
+            torch.cuda.synchronize()
+            self.gsplat_voxel = GSplatVoxel(self.gsplat, lower_bound=self.lower_bound, upper_bound=self.upper_bound, resolution=self.resolution, radius=self.radius, device=device)
+            torch.cuda.synchronize()
+            print('Time to create GSplatVoxel:', time.time() - tnow)
+            self.seed_planner = self.gsplat_voxel
+        else:
+            self.seed_planner = seed_planner
 
         # Spline planner
         self.spline_planner = spline_planner
@@ -94,16 +99,23 @@ class SplatPlan():
         tnow = time.time()
         torch.cuda.synchronize()
 
-        path = self.gsplat_voxel.create_path(x0, xf)
+        path = self.seed_planner.create_path(x0, xf)
 
         torch.cuda.synchronize()
         time_astar = time.time() - tnow
+
+        return self.generate_from_seed(path, fixed_z=None, time_seed=time_astar)
+
+    def build_corridor_from_seed(self, path):
+        path_np = path.detach().cpu().numpy() if isinstance(path, torch.Tensor) else np.asarray(path)
+        if path_np.ndim != 2 or path_np.shape[1] != 3 or len(path_np) < 2:
+            raise ValueError('seed path must have shape (N, 3), N >= 2')
 
         times_collision_set = 0
         times_polytope = 0
 
         polytopes = []      # List of polytopes (A, b)
-        segments = torch.tensor(np.stack([path[:-1], path[1:]], axis=1), device=self.device)
+        segments = torch.tensor(np.stack([path_np[:-1], path_np[1:]], axis=1), device=self.device)
 
         segment_debug = []
 
@@ -169,39 +181,54 @@ class SplatPlan():
 
             segment_debug.append(seg_debug)
 
+        return polytopes, segments, {
+            'times_collision_set': times_collision_set,
+            'times_polytope': times_polytope,
+            'segment_debug': segment_debug,
+            'segment_debug_summary': self._build_segment_debug_summary(segment_debug),
+        }
+
+    def generate_from_seed(self, path, fixed_z=None, time_seed=0.0):
+        polytopes, segments, corridor_data = self.build_corridor_from_seed(path)
+        if not polytopes:
+            raise RuntimeError('No corridor polytopes generated')
+
         # Step 4: Perform Bezier spline optimization
         tnow = time.time()
         torch.cuda.synchronize()
 
-        traj, feasible = self.spline_planner.optimize_b_spline(polytopes, segments[0][0], segments[-1][-1])
+        traj, feasible = self.spline_planner.optimize_b_spline(
+            polytopes, segments[0][0], segments[-1][-1], fixed_z=fixed_z
+        )
         if not feasible:
-            traj = torch.stack([x0, xf], dim=0)
-
             # Persist an infeasible corridor snapshot for debugging.
             self.save_polytope(polytopes, 'infeasible.obj')
-            print(compute_segment_in_polytope(polytope[0], polytope[1], segments[-1]))
-
-            if self.raise_on_infeasible:
+            print(compute_segment_in_polytope(polytopes[-1][0], polytopes[-1][1], segments[-1]))
+            if self.raise_on_infeasible or fixed_z is not None:
                 raise RuntimeError('Spline optimization infeasible')
+            traj = torch.stack([segments[0][0], segments[-1][-1]], dim=0)
 
         torch.cuda.synchronize()
         times_opt = time.time() - tnow
 
-        segment_debug_summary = self._build_segment_debug_summary(segment_debug)
-
         # Save outgoing information
+        path_np = path.detach().cpu().numpy() if isinstance(path, torch.Tensor) else np.asarray(path)
         traj_data = {
-            'path': path.tolist(),
+            'path': path_np.tolist(),
             'polytopes': [torch.cat([polytope[0], polytope[1].unsqueeze(-1)], dim=-1).tolist() for polytope in polytopes],
             'num_polytopes': len(polytopes),
             'traj': traj.tolist(),
-            'times_astar': time_astar,
-            'times_collision_set': times_collision_set,
-            'times_polytope': times_polytope,
+            'times_astar': time_seed,
+            'times_collision_set': corridor_data['times_collision_set'],
+            'times_polytope': corridor_data['times_polytope'],
             'times_opt': times_opt,
             'feasible': feasible,
-            'segment_debug': segment_debug,
-            'segment_debug_summary': segment_debug_summary,
+            'qp_status': self.spline_planner.last_solver_status,
+            'failure_reason': None if feasible else 'Spline optimization infeasible',
+            'fixed_z': fixed_z,
+            'coeffs': None if self.spline_planner.coeffs is None else self.spline_planner.coeffs.tolist(),
+            'segment_debug': corridor_data['segment_debug'],
+            'segment_debug_summary': corridor_data['segment_debug_summary'],
         }
 
         # self.save_polytope(polytopes, 'feasible.obj')

@@ -25,12 +25,11 @@ def compute_bounding_box(path, rs):
 
     local_x = (path[1:] - path[:-1]) / torch.linalg.norm(path[1:] - path[:-1], dim=-1, keepdim=True)      # This is the pointing direction of the path (N x 3)
 
-    # TODO: May have to treat the case where the path is just two points.!!!
-    # Do Gram-Schmidt to find the other two directions
-    random_vec = torch.randn(local_x.shape[-1], device=local_x.device)  # take a random vector
-    local_y = random_vec[None, :] -  torch.sum(random_vec[None, :]*local_x, dim=-1, keepdim=True) * local_x       # make it orthogonal to x
+    canonical = torch.eye(local_x.shape[-1], device=local_x.device, dtype=local_x.dtype)
+    reference = canonical[torch.argmin(torch.abs(local_x), dim=-1)]
+    local_y = reference - torch.sum(reference*local_x, dim=-1, keepdim=True) * local_x
     local_y = local_y / torch.linalg.norm(local_y, dim=-1, keepdim=True)            # normalize it
-    local_z = torch.cross(local_x, local_y)    # This is the direction perpendicular to the path and the y-axis
+    local_z = torch.cross(local_x, local_y, dim=-1)
 
     rotation_matrix = torch.stack([local_x, local_y, local_z], dim=-1)    # This is the local x,y,z to world frame rotation (N x 3 x 3)
 
@@ -86,19 +85,32 @@ def save_bounding_box(path, A, b, save_path):
     return success
 
 class CollisionSet():
-    def __init__(self, gsplat, vmax, amax, radius, device):
+    def __init__(self, gsplat, vmax, amax, radius, device, primitive_mask=None, corridor_margin=None):
         self.gsplat = gsplat
         self.vmax = vmax
         self.amax = amax
         self.radius = radius        # robot radius
         self.device = device
 
-        self.rs = vmax**2 / (2*amax) + self.radius    # Safety radius
+        if corridor_margin is None:
+            if amax <= 0:
+                raise ValueError('amax must be positive when corridor_margin is omitted')
+            self.corridor_margin = vmax**2 / (2*amax)
+        else:
+            if corridor_margin < 0:
+                raise ValueError('corridor_margin must be non-negative')
+            self.corridor_margin = float(corridor_margin)
+        self.rs = self.corridor_margin + self.radius
 
-        self.means = self.gsplat.means
-        self.rots = quaternion_to_rotation_matrix(self.gsplat.rots)
-        self.scales = self.gsplat.scales
-        self.gaussian_ids = torch.arange(self.means.shape[0], device=self.device)
+        all_ids = torch.arange(self.gsplat.means.shape[0], device=self.device)
+        if primitive_mask is None:
+            primitive_mask = torch.ones_like(all_ids, dtype=torch.bool)
+        if primitive_mask.dtype != torch.bool or primitive_mask.shape != all_ids.shape:
+            raise ValueError('primitive_mask must be boolean with one entry per Gaussian')
+        self.gaussian_ids = all_ids[primitive_mask]
+        self.means = self.gsplat.means[primitive_mask]
+        self.rots = quaternion_to_rotation_matrix(self.gsplat.rots[primitive_mask])
+        self.scales = self.gsplat.scales[primitive_mask]
 
     def compute_set(self, path, save_path=None):
         pass
@@ -110,8 +122,8 @@ class CollisionSet():
         pass
 
 class PointCloudCollisionSet(CollisionSet):
-    def __init__(self, gsplat, vmax, amax, radius, device, sample_surface=0):
-        super().__init__(gsplat, vmax, amax, radius, device)
+    def __init__(self, gsplat, vmax, amax, radius, device, sample_surface=0, primitive_mask=None, corridor_margin=None):
+        super().__init__(gsplat, vmax, amax, radius, device, primitive_mask, corridor_margin)
 
         if sample_surface > 0:
             # Apply scaling and rotation to the sphere samples, then apply translation of the mean
@@ -199,8 +211,8 @@ class PointCloudCollisionSet(CollisionSet):
         return success
 
 class GSplatCollisionSet(CollisionSet):
-    def __init__(self, gsplat, vmax, amax, radius, device):
-        super().__init__(gsplat, vmax, amax, radius, device)
+    def __init__(self, gsplat, vmax, amax, radius, device, primitive_mask=None, corridor_margin=None):
+        super().__init__(gsplat, vmax, amax, radius, device, primitive_mask, corridor_margin)
 
     # NOTE: THIS COMPUTES THE COLLISION SET FOR ALL LINE SEGMENTS IN THE PATH!!!
     def compute_set(self, path, save_path=None):
