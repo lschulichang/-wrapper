@@ -12,6 +12,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 import scipy.optimize
 import scipy.spatial
@@ -59,6 +60,33 @@ def max_control_violation(controls, polygons):
         A = A.detach().cpu().numpy(); b = b.detach().cpu().numpy()
         value = max(value, float(np.max(A @ control - b[:, None])))
     return value
+
+
+def projected_ellipse_polylines(ellipses, samples: int = 32):
+    """Return low-cost polylines for the height-filtered projected ellipses."""
+
+    if samples < 8:
+        raise ValueError("ellipse samples must be at least 8")
+    angles = torch.linspace(
+        0.0,
+        2.0 * torch.pi,
+        samples + 1,
+        device=ellipses.means.device,
+        dtype=ellipses.means.dtype,
+    )
+    unit_circle = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+    local = ellipses.scales[:, None, :] * unit_circle[None, :, :]
+    world = ellipses.means[:, None, :] + torch.einsum("nij,nkj->nki", ellipses.rots, local)
+    return world.detach().cpu().numpy()
+
+
+def configure_map_axis(ax, extent, title):
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect("equal")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title(title)
 
 
 def main():
@@ -167,24 +195,68 @@ def main():
     }
     (args.output_dir / "result.json").write_text(json.dumps(result, indent=2))
 
+    raw_occupancy = grid.raw_occupied.detach().cpu().numpy()
     occupancy = grid.occupied.detach().cpu().numpy()
     extent = [float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
-    axes[0].imshow(grid.raw_occupied.cpu().numpy().T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
-    axes[0].plot(raw_seed[:, 0], raw_seed[:, 1], label="2D Dijkstra")
-    axes[1].imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
-    axes[1].plot(raw_seed[:, 0], raw_seed[:, 1], alpha=0.4, label="raw")
-    axes[1].plot(simplified[:, 0], simplified[:, 1], "o-", label="LOS simplified")
-    for ax in axes: ax.legend(); ax.set_aspect("equal"); ax.set_xlabel("x"); ax.set_ylabel("y")
-    fig.tight_layout(); fig.savefig(args.output_dir / "ground_grid_and_seed.png", dpi=180); plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(8, 7)); ax.imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", alpha=0.45, aspect="equal")
+    # Figure 1: the height-projected voxel map before and after XY disk dilation.
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    axes[0].imshow(raw_occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
+    axes[1].imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
+    configure_map_axis(axes[0], extent, "Uninflated 2D voxel obstacles")
+    configure_map_axis(axes[1], extent, "XY-dilated 2D voxel obstacles")
+    fig.tight_layout()
+    fig.savefig(args.output_dir / "voxel_obstacles.png", dpi=180)
+    plt.close(fig)
+
+    # Figure 2: the direct 2D Dijkstra path and its deterministic LOS simplification.
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", alpha=0.72, aspect="equal")
+    ax.plot(raw_seed[:, 0], raw_seed[:, 1], color="tab:blue", linewidth=1.5, label="2D Dijkstra")
+    ax.plot(
+        simplified[:, 0], simplified[:, 1], "o--", color="tab:orange", linewidth=1.8,
+        markersize=4.5, label="LOS simplified",
+    )
+    configure_map_axis(ax, extent, "Inflated voxel map and 2D seed paths")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(args.output_dir / "dijkstra_and_simplified_path.png", dpi=180)
+    plt.close(fig)
+
+    # Figure 3: continuous projected-Gaussian geometry, convex corridor, and Bezier result.
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ellipse_lines = LineCollection(
+        projected_ellipse_polylines(ellipses),
+        colors="tab:red",
+        linewidths=0.28,
+        alpha=0.22,
+        rasterized=True,
+        label="height-filtered projected ellipses",
+        zorder=1,
+    )
+    ax.add_collection(ellipse_lines)
+    polygon_label = True
     for A, b in corridor.polygons:
         vertices = polygon_vertices(A.detach().cpu().numpy(), b.detach().cpu().numpy())
-        if vertices is not None: ax.fill(vertices[:, 0], vertices[:, 1], color="tab:green", alpha=0.18)
-    ax.plot(simplified[:, 0], simplified[:, 1], "o--", label="seed")
-    ax.plot(dense[:, :, 0].ravel(), dense[:, :, 1].ravel(), color="tab:orange", label="2D Bezier")
-    ax.legend(); ax.set_aspect("equal"); fig.tight_layout(); fig.savefig(args.output_dir / "corridor_and_trajectory.png", dpi=180); plt.close(fig)
+        if vertices is not None:
+            ax.fill(
+                vertices[:, 0], vertices[:, 1], color="tab:green", alpha=0.18,
+                label="safe polygons" if polygon_label else None, zorder=2,
+            )
+            polygon_label = False
+    ax.plot(
+        simplified[:, 0], simplified[:, 1], "o--", color="tab:blue", linewidth=1.6,
+        markersize=4.5, label="simplified seed", zorder=3,
+    )
+    ax.plot(
+        dense[:, :, 0].ravel(), dense[:, :, 1].ravel(), color="tab:orange",
+        linewidth=2.0, label="2D Bezier", zorder=4,
+    )
+    configure_map_axis(ax, extent, "Projected ellipses, safe corridor, and 2D Bezier")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(args.output_dir / "projected_ellipses_corridor_bezier.png", dpi=180)
+    plt.close(fig)
 
     print(json.dumps(result, indent=2))
     if not all([

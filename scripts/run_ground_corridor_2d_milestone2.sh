@@ -30,6 +30,7 @@ cat > "$RUN_DIR/notes.md" <<EOF
 - Goal: direct 2D Dijkstra, projected Gaussian ellipses, paper-style 2D separating lines, convex corridor, and 2D Bezier QP.
 - Robot: 15 cm projected circle; no circumscribed sphere.
 - Path simplification uses only the conservative inflated-grid line-of-sight condition; exact circle-ellipse collision is a separate consistency verification.
+- Figures: voxel_obstacles.png compares raw/dilated voxels; dijkstra_and_simplified_path.png shows both seed paths; projected_ellipses_corridor_bezier.png shows the continuous planar geometry and optimized trajectory.
 - Result: see assets/result.json and assets/verification.json.
 EOF
 echo "run_dir=$RUN_DIR"
