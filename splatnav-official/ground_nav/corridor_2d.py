@@ -94,7 +94,17 @@ class PlanarCollisionSet:
 
     def candidates(self, segment):
         segment = torch.as_tensor(segment, dtype=self.ellipses.means.dtype, device=self.device)
-        A, b, midpoint = compute_rotated_rectangle(segment, self.radius + self.corridor_margin)
+        midpoint = 0.5 * (segment[0] + segment[1])
+        if float(torch.linalg.norm(segment[1] - segment[0])) <= 1e-12:
+            A = torch.tensor(
+                [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]],
+                dtype=segment.dtype,
+                device=segment.device,
+            )
+            half_margin = self.radius + self.corridor_margin
+            b = A @ midpoint + half_margin
+        else:
+            A, b, midpoint = compute_rotated_rectangle(segment, self.radius + self.corridor_margin)
         keep = ellipse_halfspace_intersection(
             self.ellipses.means, self.ellipses.rots, self.ellipses.scales, A, b
         )

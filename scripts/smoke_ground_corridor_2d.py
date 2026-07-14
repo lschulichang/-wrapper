@@ -176,6 +176,18 @@ def main():
         args.output_dir / "projected_gaussians.npz",
         ids=ellipses.ids.detach().cpu().numpy(), means=ellipses.means.detach().cpu().numpy(), covs=ellipses.covs.detach().cpu().numpy(),
     )
+    np.savez_compressed(
+        args.output_dir / "ground_grid.npz",
+        raw_occupied=grid.raw_occupied.detach().cpu().numpy(),
+        occupied=grid.occupied.detach().cpu().numpy(),
+        lower_center=grid.lower_center.detach().cpu().numpy(),
+        cell_sizes=grid.cell_sizes.detach().cpu().numpy(),
+        shape=np.asarray(grid.shape, dtype=np.int64),
+        extent=np.asarray([
+            float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])
+        ], dtype=np.float64),
+        scale=np.asarray(scale, dtype=np.float64),
+    )
     (args.output_dir / "polygons.json").write_text(json.dumps(polygon_json, indent=2))
     (args.output_dir / "verification.json").write_text(json.dumps(verification, indent=2))
     result = {

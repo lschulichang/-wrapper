@@ -89,6 +89,12 @@ class Milestone2DTest(unittest.TestCase):
         self.assertEqual(result["deltas"].shape, (0, 2))
         self.assertEqual(result["Q_opt"].shape, (0, 2, 2))
 
+    def test_stationary_circle_ellipse_safety(self):
+        ellipses = ellipse_set([[0.0, 0.0]], [[0.25, 0.15]])
+        collision_set = PlanarCollisionSet(ellipses, radius=0.1, corridor_margin=0.5)
+        self.assertFalse(collision_set.segment_is_safe(np.array([[0.0, 0.0], [0.0, 0.0]])))
+        self.assertTrue(collision_set.segment_is_safe(np.array([[0.0, 1.0], [0.0, 1.0]])))
+
     def test_simplification_uses_grid_line_of_sight_only(self):
         grid = FakeGrid()
         path = np.array([[0.1, 0.1], [0.5, 0.1], [0.9, 0.1], [0.9, 1.7], [1.5, 1.7]])
