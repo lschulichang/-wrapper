@@ -58,3 +58,40 @@ def simplify_ground_path(path: np.ndarray, grid, max_segment_length: float) -> n
         simplified.append(path[chosen])
         root = chosen
     return np.asarray(simplified, dtype=path.dtype)
+
+
+def merge_collinear_ground_path(path: np.ndarray, max_segment_length: float) -> np.ndarray:
+    """Remove only collinear forward points while respecting a segment cap.
+
+    This deliberately performs no visibility shortcut: every output segment is
+    a subset of one straight run in the original four-connected grid path.
+    """
+
+    path = np.asarray(path)
+    if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2:
+        raise ValueError("path must have shape (N, 2), N >= 2")
+    if max_segment_length <= 0:
+        raise ValueError("max_segment_length must be positive")
+    if np.any(np.linalg.norm(np.diff(path, axis=0), axis=1) <= 1e-12):
+        raise ValueError("path contains duplicate consecutive points")
+
+    result = [path[0]]
+    anchor = 0
+    while anchor < len(path) - 1:
+        direction = path[anchor + 1] - path[anchor]
+        chosen = anchor + 1
+        while chosen + 1 < len(path):
+            next_step = path[chosen + 1] - path[chosen]
+            cross = direction[0] * next_step[1] - direction[1] * next_step[0]
+            scale = max(np.linalg.norm(direction) * np.linalg.norm(next_step), 1.0)
+            same_direction = float(np.dot(direction, next_step)) > 0.0
+            within_cap = (
+                np.linalg.norm(path[chosen + 1] - path[anchor])
+                <= max_segment_length + 1e-9
+            )
+            if abs(float(cross)) > 1e-10 * scale or not same_direction or not within_cap:
+                break
+            chosen += 1
+        result.append(path[chosen])
+        anchor = chosen
+    return np.asarray(result, dtype=path.dtype)

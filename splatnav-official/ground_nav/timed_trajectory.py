@@ -1,4 +1,4 @@
-"""Arc-length and time parameterization for planar Bezier paths."""
+ """Arc-length and time parameterization for planar Bezier paths."""
 
 from __future__ import annotations
 
