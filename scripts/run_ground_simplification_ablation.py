@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Paired diagnostic ablation for three planar path simplification strategies."""
+"""Paired diagnostic ablation for four planar path simplification strategies."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import math
 import sys
@@ -30,6 +31,7 @@ from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from ground_nav.path_utils import (  # noqa: E402
     merge_collinear_ground_path,
     simplify_ground_path,
+    simplify_ground_path_supercover,
 )
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from ground_nav.timed_trajectory import evaluate_bezier_geometry  # noqa: E402
@@ -43,7 +45,7 @@ from smoke_splatplan import SCENE_PRESETS  # noqa: E402
 from splat.splat_utils import GSplatLoader  # noqa: E402
 
 
-STRATEGIES = ("A_none", "B_collinear", "C_sampled_los")
+STRATEGIES = ("A_none", "B_collinear", "C_sampled_los", "D_supercover_los")
 
 
 def sync(device):
@@ -212,6 +214,8 @@ def choose_simplified_path(strategy, raw_path, grid, max_segment_scene):
         return merge_collinear_ground_path(raw_path, max_segment_scene)
     if strategy == "C_sampled_los":
         return simplify_ground_path(raw_path, grid, max_segment_scene)
+    if strategy == "D_supercover_los":
+        return simplify_ground_path_supercover(raw_path, grid, max_segment_scene)
     raise ValueError(f"unknown strategy {strategy}")
 
 
@@ -409,7 +413,7 @@ def paired_statistics(records):
     arrays = {key: np.asarray([row[key] for row in complete]) for key in STRATEGIES}
     friedman = scipy.stats.friedmanchisquare(*(arrays[key] for key in STRATEGIES))
     raw = []
-    for first, second in ((STRATEGIES[0], STRATEGIES[1]), (STRATEGIES[0], STRATEGIES[2]), (STRATEGIES[1], STRATEGIES[2])):
+    for first, second in itertools.combinations(STRATEGIES, 2):
         result = scipy.stats.wilcoxon(arrays[first], arrays[second], alternative="two-sided")
         raw.append((f"{first}_vs_{second}", float(result.statistic), float(result.pvalue)))
     ordered = sorted(enumerate(raw), key=lambda item: item[1][2])
@@ -562,7 +566,7 @@ def plot_quality(output_dir, records, sample_count):
 
 
 def plot_representatives(output_dir, representatives, artifacts, occupied, extent):
-    fig, axes = plt.subplots(3, 3, figsize=(15, 14))
+    fig, axes = plt.subplots(3, len(STRATEGIES), figsize=(20, 14))
     for row_index, candidate in enumerate(representatives):
         for column_index, strategy in enumerate(STRATEGIES):
             axis = axes[row_index, column_index]
@@ -589,7 +593,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--scene", default="old_union", choices=sorted(SCENE_PRESETS))
-    parser.add_argument("--z-floor", type=float, default=-0.15)
+    parser.add_argument(
+        "--z-floor-scene", "--z-floor", dest="z_floor_scene", type=float, default=-0.15,
+        help="Floor Z in normalized scene coordinates; --z-floor is a deprecated alias",
+    )
     parser.add_argument("--robot-height-meters", type=float, default=0.10)
     parser.add_argument("--footprint-radius-meters", type=float, default=0.15)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.02)
@@ -626,8 +633,8 @@ def main():
     preset = SCENE_PRESETS[args.scene]
     lower = torch.tensor(preset["lower_bound"], device=device)
     upper = torch.tensor(preset["upper_bound"], device=device)
-    lower[2] = min(float(lower[2]), args.z_floor)
-    upper[2] = max(float(upper[2]), args.z_floor + height)
+    lower[2] = min(float(lower[2]), args.z_floor_scene)
+    upper[2] = max(float(upper[2]), args.z_floor_scene + height)
 
     preprocessing = {}
     sync(device); start_time = time.perf_counter(); gsplat = GSplatLoader(args.config, device); sync(device)
@@ -635,7 +642,7 @@ def main():
     start_time = time.perf_counter(); voxel = GSplatVoxel(gsplat, lower, upper, preset["resolution"], 0.0, device); sync(device)
     preprocessing["voxel_s"] = time.perf_counter() - start_time
     start_time = time.perf_counter(); grid = GroundGrid(
-        voxel, args.z_floor, height, radius,
+        voxel, args.z_floor_scene, height, radius,
         ground_clearance=clearance, project_occupied_endpoints=False,
     ); sync(device); preprocessing["height_projection_xy_dilation_s"] = time.perf_counter() - start_time
     start_time = time.perf_counter(); ellipses = PlanarGaussianSet.from_gsplat(
@@ -696,13 +703,14 @@ def main():
 
     records = []
     artifacts = {}
-    orders = (
-        STRATEGIES,
-        ("B_collinear", "C_sampled_los", "A_none"),
-        ("C_sampled_los", "A_none", "B_collinear"),
+    # Rotate the execution order across trials so each strategy occupies every
+    # within-trial position equally often over each block of four trials.
+    orders = tuple(
+        STRATEGIES[offset:] + STRATEGIES[:offset]
+        for offset in range(len(STRATEGIES))
     )
     for trial_index, candidate in enumerate(selected):
-        for execution_order, strategy in enumerate(orders[trial_index % 3]):
+        for execution_order, strategy in enumerate(orders[trial_index % len(orders)]):
             print(f"[{trial_index + 1:02d}/{len(selected)}] {candidate['trial_id']} {strategy}", flush=True)
             record, artifact = run_variant(
                 candidate, strategy, grid, collision_set, scale,
@@ -726,6 +734,7 @@ def main():
         "scene": args.scene,
         "device": str(device),
         "scale": scale,
+        "z_floor_scene": args.z_floor_scene,
         "preprocessing": preprocessing,
         "physical_parameters": {
             "robot_height_m": args.robot_height_meters,

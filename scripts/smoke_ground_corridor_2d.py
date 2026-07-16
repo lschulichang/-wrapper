@@ -93,7 +93,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--scene", default="old_union", choices=sorted(SCENE_PRESETS))
-    parser.add_argument("--z-floor", type=float, default=-0.15)
+    parser.add_argument(
+        "--z-floor-scene", "--z-floor", dest="z_floor_scene", type=float, default=-0.15,
+        help="Floor Z in normalized scene coordinates; --z-floor is a deprecated alias",
+    )
     parser.add_argument("--robot-height-meters", type=float, default=0.10)
     parser.add_argument("--footprint-radius-meters", type=float, default=0.15)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.02)
@@ -115,14 +118,14 @@ def main():
     preset = SCENE_PRESETS[args.scene]
     lower = torch.tensor(preset["lower_bound"], device=device)
     upper = torch.tensor(preset["upper_bound"], device=device)
-    lower[2] = min(float(lower[2]), args.z_floor)
-    upper[2] = max(float(upper[2]), args.z_floor + height)
+    lower[2] = min(float(lower[2]), args.z_floor_scene)
+    upper[2] = max(float(upper[2]), args.z_floor_scene + height)
 
     timings = {}
     t0 = time.time(); gsplat = GSplatLoader(args.config, device); sync(device); timings["gsplat_load"] = time.time() - t0
     t0 = time.time(); voxel = GSplatVoxel(gsplat, lower, upper, preset["resolution"], 0.0, device); sync(device); timings["voxel"] = time.time() - t0
     t0 = time.time(); grid = GroundGrid(
-        voxel, args.z_floor, height, radius, ground_clearance=clearance, project_occupied_endpoints=False
+        voxel, args.z_floor_scene, height, radius, ground_clearance=clearance, project_occupied_endpoints=False
     ); sync(device); timings["height_projection_xy_dilation"] = time.time() - t0
     t0 = time.time(); ellipses = PlanarGaussianSet.from_gsplat(gsplat, grid.metadata.z_min, grid.metadata.z_max); sync(device); timings["ellipse_projection"] = time.time() - t0
     collision_set = PlanarCollisionSet(ellipses, radius=radius, corridor_margin=margin, iterations=10)
@@ -198,7 +201,8 @@ def main():
         },
         "scene_units": {
             "height": height, "circle_radius": radius, "ground_clearance": clearance,
-            "corridor_margin": margin, "z_min": grid.metadata.z_min, "z_max": grid.metadata.z_max,
+            "corridor_margin": margin, "z_floor_scene": args.z_floor_scene,
+            "z_min": grid.metadata.z_min, "z_max": grid.metadata.z_max,
         },
         "gaussians_total": int(gsplat.means.shape[0]), "projected_ellipses": len(ellipses),
         "raw_seed_points": len(raw_seed), "simplified_seed_points": len(simplified),

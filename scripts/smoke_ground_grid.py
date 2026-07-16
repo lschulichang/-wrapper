@@ -33,7 +33,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--scene", required=True)
-    parser.add_argument("--z-floor", required=True, type=float, help="Floor Z in normalized scene coordinates")
+    parser.add_argument(
+        "--z-floor-scene", "--z-floor", dest="z_floor_scene", required=True, type=float,
+        help="Floor Z in normalized scene coordinates; --z-floor is a deprecated alias",
+    )
     parser.add_argument("--robot-height-meters", required=True, type=float)
     parser.add_argument("--footprint-radius-meters", required=True, type=float)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.0)
@@ -71,8 +74,8 @@ def main() -> None:
     # The original presets were designed for drone paths and may not cover the
     # complete cylinder height. Expand Z so the requested body band is never
     # silently truncated; preserve the preset XY planning region.
-    lower_bound[2] = min(float(lower_bound[2].item()), args.z_floor)
-    upper_bound[2] = max(float(upper_bound[2].item()), args.z_floor + robot_height)
+    lower_bound[2] = min(float(lower_bound[2].item()), args.z_floor_scene)
+    upper_bound[2] = max(float(upper_bound[2].item()), args.z_floor_scene + robot_height)
     raw_voxel = GSplatVoxel(
         gsplat,
         lower_bound=lower_bound,
@@ -83,7 +86,7 @@ def main() -> None:
     )
     grid = GroundGrid(
         raw_voxel,
-        z_floor=args.z_floor,
+        z_floor_scene=args.z_floor_scene,
         robot_height=robot_height,
         footprint_radius=footprint_radius,
         ground_clearance=ground_clearance,
@@ -167,7 +170,7 @@ def main() -> None:
         "device": str(device),
         "unit_conversion": {
             "scene_units_per_meter": scene_units_per_meter,
-            "z_floor_scene_units": args.z_floor,
+            "z_floor_scene_units": args.z_floor_scene,
             "robot_height_meters": args.robot_height_meters,
             "robot_height_scene_units": robot_height,
             "footprint_radius_meters": args.footprint_radius_meters,

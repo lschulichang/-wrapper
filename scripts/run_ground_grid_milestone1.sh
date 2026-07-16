@@ -17,7 +17,7 @@ unset LD_LIBRARY_PATH
 python $ROOT/scripts/smoke_ground_grid.py \\
   --scene old_union \\
   --config $CONFIG \\
-  --z-floor -0.15 \\
+  --z-floor-scene -0.15 \\
   --robot-height-meters 0.10 \\
   --footprint-radius-meters 0.15 \\
   --ground-clearance-meters 0.02 \\
@@ -37,7 +37,7 @@ unset LD_LIBRARY_PATH
 python "$ROOT/scripts/smoke_ground_grid.py" \
   --scene old_union \
   --config "$CONFIG" \
-  --z-floor -0.15 \
+  --z-floor-scene -0.15 \
   --robot-height-meters 0.10 \
   --footprint-radius-meters 0.15 \
   --ground-clearance-meters 0.02 \
@@ -54,7 +54,7 @@ cat > "$RUN_DIR/notes.md" <<EOF
 
 - Goal: Milestone 1 ground-grid projection, XY disk dilation, and 2D path planning on old_union.
 - Result: Completed successfully; see assets/ground_grid.json and assets/verification.json.
-- Parameters: z_floor=-0.15 scene units, height=0.10 m, footprint radius=0.15 m, ground clearance=0.02 m.
+- Parameters: z_floor_scene=-0.15 scene units, height=0.10 m, footprint radius=0.15 m, ground clearance=0.02 m.
 - Issues: None in this rerun.
 - Next: Connect the verified 2D seed path to the Splat-Plan corridor pipeline.
 EOF

@@ -13,7 +13,7 @@ mkdir -p "$RUN_DIR/assets"
 COMMAND=(
   python "$ROOT/scripts/run_ground_simplification_ablation.py"
   --scene old_union --config "$CONFIG"
-  --z-floor -0.15
+  --z-floor-scene -0.15
   --robot-height-meters 0.10
   --footprint-radius-meters 0.15
   --ground-clearance-meters 0.02
@@ -55,7 +55,8 @@ cat > "$RUN_DIR/notes.md" <<'EOF'
 - A: raw four-connected Dijkstra path, with no simplification.
 - B: remove only collinear forward points, with the shared 1 m segment cap.
 - C: current sampled inflated-grid LOS simplification, with the shared 1 m cap.
-- The same raw Dijkstra path is reused for A/B/C for every selected endpoint pair.
+- D: integer supercover inflated-grid LOS simplification, with the shared 1 m cap.
+- The same raw Dijkstra path is reused for A/B/C/D for every selected endpoint pair.
 - Thirty pairs are sampled from the largest inflated-grid free component and stratified into low/medium/high raw-turn terciles.
 - The fixed milestone 2/4 endpoint pair is saved separately and is not included in the paired statistics.
 - Primary downstream time excludes map/GS loading and candidate generation.

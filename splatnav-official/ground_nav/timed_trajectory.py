@@ -1,4 +1,4 @@
- """Arc-length and time parameterization for planar Bezier paths."""
+"""Arc-length and time parameterization for planar Bezier paths."""
 
 from __future__ import annotations
 
@@ -234,4 +234,3 @@ class TimedTrajectory:
         for column in (4, 5, 6, 7):
             values.append(float(np.interp(time_s, timestamps, self.data[:, column])))
         return ReferenceState(*values)
-

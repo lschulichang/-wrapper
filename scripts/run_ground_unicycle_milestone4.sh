@@ -9,7 +9,7 @@ CONFIG="$ROOT/splatnav-official/outputs/old_union2/splatfacto/2024-09-02_151414/
 cd "$ROOT"
 RUN_DIR="$(scripts/create_run_dir.sh "$TOPIC")"
 cat > "$RUN_DIR/cmd.txt" <<EOF
-python $ROOT/scripts/smoke_ground_corridor_2d.py --scene old_union --config $CONFIG --z-floor -0.15 --robot-height-meters 0.10 --footprint-radius-meters 0.15 --ground-clearance-meters 0.02 --corridor-margin-meters 0.10 --max-segment-meters 1.0 --start 0.7209999561 0.2604999840 --goal -0.5350000262 0.2300000042 --output-dir $RUN_DIR/assets
+python $ROOT/scripts/smoke_ground_corridor_2d.py --scene old_union --config $CONFIG --z-floor-scene -0.15 --robot-height-meters 0.10 --footprint-radius-meters 0.15 --ground-clearance-meters 0.02 --corridor-margin-meters 0.10 --max-segment-meters 1.0 --start 0.7209999561 0.2604999840 --goal -0.5350000262 0.2300000042 --output-dir $RUN_DIR/assets
 python $ROOT/scripts/smoke_ground_unicycle.py --assets-dir $RUN_DIR/assets --ds-meters 0.02 --max-speed-mps 0.20 --max-accel-mps2 0.30 --max-omega-radps 1.0 --max-alpha-radps2 2.0 --dt 0.02 --settle-timeout 5.0 --kx 1.0 --ky 2.0 --ktheta 2.0
 EOF
 git status --short > "$RUN_DIR/git_status.txt"
@@ -20,7 +20,7 @@ source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate splatnav
 unset LD_LIBRARY_PATH
 python "$ROOT/scripts/smoke_ground_corridor_2d.py" \
-  --scene old_union --config "$CONFIG" --z-floor -0.15 \
+  --scene old_union --config "$CONFIG" --z-floor-scene -0.15 \
   --robot-height-meters 0.10 --footprint-radius-meters 0.15 --ground-clearance-meters 0.02 \
   --corridor-margin-meters 0.10 --max-segment-meters 1.0 \
   --start 0.7209999561 0.2604999840 --goal -0.5350000262 0.2300000042 \

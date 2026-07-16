@@ -15,7 +15,7 @@ import torch.nn.functional as F
 class GroundGridMetadata:
     """Description of the height-band projection used to build a ground grid."""
 
-    z_floor: float
+    z_floor_scene: float
     robot_height: float
     footprint_radius: float
     ground_clearance: float
@@ -24,25 +24,40 @@ class GroundGridMetadata:
     reference_z: float
     z_indices: tuple[int, ...]
 
+    @property
+    def z_floor(self) -> float:
+        """Deprecated compatibility alias for the scene-coordinate floor Z."""
+
+        return self.z_floor_scene
+
 
 class GroundGrid:
     """A 2D occupancy grid projected from an existing 3D ``Voxel`` object.
 
     The input must be an *uninflated* 3D occupancy grid. Obstacles intersecting
-    ``[z_floor + ground_clearance, z_floor + robot_height]`` are projected with
+    ``[z_floor_scene + ground_clearance, z_floor_scene + robot_height]`` are projected with
     a logical OR along Z, then dilated only in XY by the circular footprint.
     """
 
     def __init__(
         self,
         voxel_grid: Any,
-        z_floor: float,
-        robot_height: float,
-        footprint_radius: float,
+        z_floor_scene: float | None = None,
+        robot_height: float | None = None,
+        footprint_radius: float | None = None,
         *,
         ground_clearance: float = 0.0,
         project_occupied_endpoints: bool = True,
+        z_floor: float | None = None,
     ) -> None:
+        if z_floor_scene is None:
+            if z_floor is None:
+                raise ValueError("z_floor_scene must be provided")
+            z_floor_scene = float(z_floor)
+        elif z_floor is not None:
+            raise ValueError("provide only z_floor_scene; z_floor is a deprecated alias")
+        if robot_height is None or footprint_radius is None:
+            raise ValueError("robot_height and footprint_radius must be provided")
         if robot_height <= 0:
             raise ValueError("robot_height must be positive")
         if footprint_radius < 0:
@@ -66,8 +81,8 @@ class GroundGrid:
         self.device = voxel_grid.non_navigable_grid.device
         self.project_occupied_endpoints = project_occupied_endpoints
 
-        z_min = float(z_floor + ground_clearance)
-        z_max = float(z_floor + robot_height)
+        z_min = float(z_floor_scene + ground_clearance)
+        z_max = float(z_floor_scene + robot_height)
         z_centers = voxel_grid.grid_centers[0, 0, :, 2]
         half_cell_z = voxel_grid.cell_sizes[2] / 2
         z_cell_min = z_centers - half_cell_z
@@ -93,13 +108,13 @@ class GroundGrid:
             )
 
         self.metadata = GroundGridMetadata(
-            z_floor=float(z_floor),
+            z_floor_scene=float(z_floor_scene),
             robot_height=float(robot_height),
             footprint_radius=float(footprint_radius),
             ground_clearance=float(ground_clearance),
             z_min=z_min,
             z_max=z_max,
-            reference_z=float(z_floor + robot_height / 2),
+            reference_z=float(z_floor_scene + robot_height / 2),
             z_indices=tuple(int(i) for i in z_indices.cpu().tolist()),
         )
 
@@ -268,7 +283,8 @@ class GroundGrid:
             "free_cells": int(self.free.sum().item()),
             "occupied_fraction": float(self.occupied.float().mean().item()),
             "cell_sizes_xy": [float(v) for v in self.cell_sizes.detach().cpu().tolist()],
-            "z_floor": self.metadata.z_floor,
+            "z_floor_scene": self.metadata.z_floor_scene,
+            "z_floor": self.metadata.z_floor_scene,
             "robot_height": self.metadata.robot_height,
             "footprint_radius": self.metadata.footprint_radius,
             "ground_clearance": self.metadata.ground_clearance,

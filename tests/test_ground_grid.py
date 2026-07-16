@@ -47,7 +47,7 @@ class GroundGridTest(unittest.TestCase):
     def setUp(self) -> None:
         self.grid = GroundGrid(
             fake_voxel(),
-            z_floor=1.0,
+            z_floor_scene=1.0,
             robot_height=1.0,
             footprint_radius=0.0,
         )
@@ -83,14 +83,23 @@ class GroundGridTest(unittest.TestCase):
 
     def test_invalid_height_band_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            GroundGrid(fake_voxel(), z_floor=8.0, robot_height=1.0, footprint_radius=0.0)
+            GroundGrid(fake_voxel(), z_floor_scene=8.0, robot_height=1.0, footprint_radius=0.0)
+
+    def test_deprecated_z_floor_alias_matches_scene_named_argument(self) -> None:
+        legacy = GroundGrid(fake_voxel(), z_floor=1.0, robot_height=1.0, footprint_radius=0.0)
+        explicit = GroundGrid(
+            fake_voxel(), z_floor_scene=1.0, robot_height=1.0, footprint_radius=0.0
+        )
+        torch.testing.assert_close(legacy.occupied, explicit.occupied)
+        self.assertEqual(explicit.metadata.z_floor_scene, 1.0)
+        self.assertEqual(explicit.metadata.z_floor, 1.0)
 
     def test_ground_clearance_excludes_floor_layer(self) -> None:
         voxel = fake_voxel()
         voxel.non_navigable_grid[2, 2, 0] = True
         grid = GroundGrid(
             voxel,
-            z_floor=0.0,
+            z_floor_scene=0.0,
             robot_height=2.0,
             footprint_radius=0.0,
             ground_clearance=1.0,
@@ -103,7 +112,7 @@ class GroundGridTest(unittest.TestCase):
         voxel.non_navigable_grid[3, 3, 1] = True
         grid = GroundGrid(
             voxel,
-            z_floor=1.0,
+            z_floor_scene=1.0,
             robot_height=1.0,
             footprint_radius=0.6,
         )
@@ -116,7 +125,7 @@ class GroundGridTest(unittest.TestCase):
         voxel = fake_voxel()
         voxel.radius = 0.1
         with self.assertRaises(ValueError):
-            GroundGrid(voxel, z_floor=1.0, robot_height=1.0, footprint_radius=0.1)
+            GroundGrid(voxel, z_floor_scene=1.0, robot_height=1.0, footprint_radius=0.1)
 
     def test_gsplat_voxel_supports_uninflated_radius_zero(self) -> None:
         gsplat = SimpleNamespace(

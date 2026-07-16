@@ -33,8 +33,81 @@ def line_of_sight_free(grid, start_xy, goal_xy) -> bool:
     return True
 
 
-def simplify_ground_path(path: np.ndarray, grid, max_segment_length: float) -> np.ndarray:
-    """Greedily select the farthest visible waypoint; safety comes from the grid."""
+def supercover_grid_indices(start_index, goal_index) -> list[tuple[int, int]]:
+    """Return every integer grid cell touched by a centre-to-centre segment.
+
+    When the segment passes exactly through a grid corner, both side-adjacent
+    cells are included in addition to the diagonal cell.  This closed-cell
+    convention is deliberately conservative for occupancy-grid collision
+    checking and uses integer arithmetic only.
+    """
+
+    start = np.asarray(start_index, dtype=np.int64).reshape(-1)
+    goal = np.asarray(goal_index, dtype=np.int64).reshape(-1)
+    if start.size < 2 or goal.size < 2:
+        raise ValueError("grid indices must contain two coordinates")
+
+    x, y = int(start[0]), int(start[1])
+    goal_x, goal_y = int(goal[0]), int(goal[1])
+    dx, dy = goal_x - x, goal_y - y
+    nx, ny = abs(dx), abs(dy)
+    step_x = 0 if dx == 0 else (1 if dx > 0 else -1)
+    step_y = 0 if dy == 0 else (1 if dy > 0 else -1)
+    ix = iy = 0
+    cells: list[tuple[int, int]] = [(x, y)]
+
+    def append_unique(cell: tuple[int, int]) -> None:
+        if cell != cells[-1]:
+            cells.append(cell)
+
+    while ix < nx or iy < ny:
+        decision = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx
+        if decision == 0:
+            # The segment crosses a grid corner.  Closed-cell supercover
+            # includes the two cells touching that corner from either side.
+            if ix < nx:
+                append_unique((x + step_x, y))
+            if iy < ny:
+                append_unique((x, y + step_y))
+            if ix < nx:
+                x += step_x
+                ix += 1
+            if iy < ny:
+                y += step_y
+                iy += 1
+            append_unique((x, y))
+        elif decision < 0:
+            x += step_x
+            ix += 1
+            append_unique((x, y))
+        else:
+            y += step_y
+            iy += 1
+            append_unique((x, y))
+    return cells
+
+
+def line_of_sight_supercover_free(grid, start_xy, goal_xy) -> bool:
+    """Test LOS by enumerating all inflated-grid cells touched by the segment."""
+
+    start_index = grid.world_to_grid(start_xy).detach().cpu().numpy()
+    goal_index = grid.world_to_grid(goal_xy).detach().cpu().numpy()
+    occupied = grid.occupied.detach().cpu().numpy()
+    for i, j in supercover_grid_indices(start_index, goal_index):
+        if not (0 <= i < grid.shape[0] and 0 <= j < grid.shape[1]):
+            return False
+        if occupied[i, j]:
+            return False
+    return True
+
+
+def _simplify_ground_path(
+    path: np.ndarray,
+    grid,
+    max_segment_length: float,
+    visibility_test,
+) -> np.ndarray:
+    """Shared farthest-visible greedy simplifier."""
 
     path = np.asarray(path)
     if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2:
@@ -49,7 +122,7 @@ def simplify_ground_path(path: np.ndarray, grid, max_segment_length: float) -> n
             segment = path[[root, candidate]]
             if np.linalg.norm(segment[1] - segment[0]) > max_segment_length + 1e-9:
                 continue
-            if not line_of_sight_free(grid, segment[0], segment[1]):
+            if not visibility_test(grid, segment[0], segment[1]):
                 continue
             chosen = candidate
             break
@@ -58,6 +131,27 @@ def simplify_ground_path(path: np.ndarray, grid, max_segment_length: float) -> n
         simplified.append(path[chosen])
         root = chosen
     return np.asarray(simplified, dtype=path.dtype)
+
+
+def simplify_ground_path(path: np.ndarray, grid, max_segment_length: float) -> np.ndarray:
+    """Greedily simplify using the legacy sampled LOS test (strategy C)."""
+
+    return _simplify_ground_path(path, grid, max_segment_length, line_of_sight_free)
+
+
+def simplify_ground_path_supercover(
+    path: np.ndarray,
+    grid,
+    max_segment_length: float,
+) -> np.ndarray:
+    """Greedily simplify using integer supercover LOS (strategy D)."""
+
+    return _simplify_ground_path(
+        path,
+        grid,
+        max_segment_length,
+        line_of_sight_supercover_free,
+    )
 
 
 def merge_collinear_ground_path(path: np.ndarray, max_segment_length: float) -> np.ndarray:
