@@ -23,6 +23,10 @@ class GroundGridMetadata:
     z_max: float
     reference_z: float
     z_indices: tuple[int, ...]
+    source: str = "legacy_voxel_projection"
+    rasterization: str = "voxel_height_projection_xy_dilation"
+    confidence: float | None = None
+    cell_circumradius: float | None = None
 
     @property
     def z_floor(self) -> float:
@@ -128,6 +132,267 @@ class GroundGrid:
         self.occupied = self._dilate(self.raw_occupied, self.dilation_kernel)
         self.free = ~self.occupied
         self.shape = tuple(int(v) for v in self.occupied.shape)
+
+    @classmethod
+    def from_projected_gaussians(
+        cls,
+        ellipses: Any,
+        lower_xy: Sequence[float] | np.ndarray | torch.Tensor,
+        upper_xy: Sequence[float] | np.ndarray | torch.Tensor,
+        resolution_xy: int | Sequence[int] | np.ndarray | torch.Tensor,
+        footprint_radius: float,
+        *,
+        z_floor_scene: float | None = None,
+        robot_height: float | None = None,
+        ground_clearance: float = 0.0,
+        project_occupied_endpoints: bool = False,
+        distance_iterations: int = 40,
+        max_pair_chunk: int = 1_000_000,
+    ) -> "GroundGrid":
+        """Rasterize height-filtered projected ellipses conservatively.
+
+        A cell is occupied when the Euclidean distance from its center to any
+        projected ellipse is no greater than the requested footprint radius
+        plus the cell circumradius. The circumradius makes this a conservative
+        rectangle-intersection test rather than a center-only approximation.
+        """
+
+        if footprint_radius < 0:
+            raise ValueError("footprint_radius must be non-negative")
+        if distance_iterations <= 0:
+            raise ValueError("distance_iterations must be positive")
+        if max_pair_chunk <= 0:
+            raise ValueError("max_pair_chunk must be positive")
+        if ellipses.means.ndim != 2 or ellipses.means.shape[1] != 2:
+            raise ValueError("ellipses.means must have shape (N, 2)")
+        if ellipses.rots.shape != (len(ellipses), 2, 2):
+            raise ValueError("ellipses.rots must have shape (N, 2, 2)")
+        if ellipses.scales.shape != (len(ellipses), 2):
+            raise ValueError("ellipses.scales must have shape (N, 2)")
+        if not bool(torch.all(torch.isfinite(ellipses.means)).item()):
+            raise ValueError("ellipse means must be finite")
+        if not bool(torch.all(torch.isfinite(ellipses.scales)).item()):
+            raise ValueError("ellipse scales must be finite")
+        if not bool(torch.all(ellipses.scales > 0).item()):
+            raise ValueError("ellipse scales must be positive")
+
+        device = ellipses.means.device
+        dtype = ellipses.means.dtype
+        lower = torch.as_tensor(lower_xy, dtype=dtype, device=device).flatten()
+        upper = torch.as_tensor(upper_xy, dtype=dtype, device=device).flatten()
+        if lower.numel() != 2 or upper.numel() != 2:
+            raise ValueError("lower_xy and upper_xy must each contain two values")
+        if not bool(torch.all(upper > lower).item()):
+            raise ValueError("lower_xy and upper_xy must define a positive 2D extent")
+        if isinstance(resolution_xy, int):
+            resolution = torch.tensor(
+                [resolution_xy, resolution_xy], device=device, dtype=torch.long
+            )
+        else:
+            resolution = torch.as_tensor(
+                resolution_xy, device=device, dtype=torch.long
+            ).flatten()
+        if resolution.numel() != 2 or not bool(torch.all(resolution > 0).item()):
+            raise ValueError("resolution_xy must contain two positive integers")
+
+        obj = cls.__new__(cls)
+        obj.voxel_grid = None
+        obj.ellipses = ellipses
+        obj.device = device
+        obj.project_occupied_endpoints = project_occupied_endpoints
+        obj.cell_sizes = (upper - lower) / resolution.to(dtype)
+        xs = lower[0] + (
+            torch.arange(int(resolution[0]), device=device, dtype=dtype) + 0.5
+        ) * obj.cell_sizes[0]
+        ys = lower[1] + (
+            torch.arange(int(resolution[1]), device=device, dtype=dtype) + 0.5
+        ) * obj.cell_sizes[1]
+        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+        obj.xy_centers = torch.stack([gx, gy], dim=-1)
+        obj.lower_center = obj.xy_centers[0, 0]
+        obj.shape = (int(resolution[0]), int(resolution[1]))
+        cell_circumradius = 0.5 * float(torch.linalg.norm(obj.cell_sizes).item())
+        obj.raw_occupied, obj.occupied = obj._rasterize_projected_gaussians(
+            raw_threshold=cell_circumradius,
+            occupied_threshold=float(footprint_radius) + cell_circumradius,
+            distance_iterations=distance_iterations,
+            max_pair_chunk=max_pair_chunk,
+        )
+        obj.free = ~obj.occupied
+        obj.dilation_kernel = None
+        z_min = float(ellipses.z_min)
+        z_max = float(ellipses.z_max)
+        if z_floor_scene is None:
+            z_floor_scene = z_min
+        if robot_height is None:
+            robot_height = z_max - float(z_floor_scene)
+        expected_z_min = float(z_floor_scene) + float(ground_clearance)
+        expected_z_max = float(z_floor_scene) + float(robot_height)
+        if not np.isclose(expected_z_min, z_min) or not np.isclose(expected_z_max, z_max):
+            raise ValueError(
+                "height metadata disagrees with the projected Gaussian height band"
+            )
+        obj.metadata = GroundGridMetadata(
+            z_floor_scene=float(z_floor_scene),
+            robot_height=float(robot_height),
+            footprint_radius=float(footprint_radius),
+            ground_clearance=float(ground_clearance),
+            z_min=z_min,
+            z_max=z_max,
+            reference_z=0.5 * (z_min + z_max),
+            z_indices=(),
+            source="projected_gaussians",
+            rasterization="center_distance_plus_cell_circumradius",
+            confidence=float(ellipses.confidence),
+            cell_circumradius=cell_circumradius,
+        )
+        return obj
+
+    @staticmethod
+    def point_to_ellipse_distance(
+        points: torch.Tensor,
+        means: torch.Tensor,
+        rots: torch.Tensor,
+        scales: torch.Tensor,
+        iterations: int = 40,
+    ) -> torch.Tensor:
+        """Return Euclidean distances from points to filled 2D ellipses."""
+
+        if points.shape != means.shape or points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("points and means must both have shape (N, 2)")
+        if rots.shape != (points.shape[0], 2, 2):
+            raise ValueError("rots must have shape (N, 2, 2)")
+        if scales.shape != points.shape:
+            raise ValueError("scales must have shape (N, 2)")
+        if iterations <= 0:
+            raise ValueError("iterations must be positive")
+        if points.shape[0] == 0:
+            return torch.empty(0, dtype=points.dtype, device=points.device)
+
+        local = torch.einsum("nij,nj->ni", rots.transpose(1, 2), points - means)
+        axis2 = scales.square().clamp_min(torch.finfo(scales.dtype).eps)
+        normalized = torch.sum(local.square() / axis2, dim=-1)
+        outside = normalized > 1.0
+        distances = torch.zeros(points.shape[0], dtype=points.dtype, device=points.device)
+        if not bool(torch.any(outside).item()):
+            return distances
+
+        y = local[outside]
+        a2 = axis2[outside]
+        lo = torch.zeros(y.shape[0], dtype=y.dtype, device=y.device)
+        # This upper bound guarantees sum(a_i^2 y_i^2 / lambda^2) <= 1.
+        hi = torch.sqrt(torch.sum(a2 * y.square(), dim=-1)).clamp_min(
+            torch.finfo(y.dtype).eps
+        )
+        for _ in range(iterations):
+            lam = 0.5 * (lo + hi)
+            value = torch.sum(
+                a2 * y.square() / (a2 + lam[:, None]).square(), dim=-1
+            )
+            lo = torch.where(value > 1.0, lam, lo)
+            hi = torch.where(value <= 1.0, lam, hi)
+        closest = a2 * y / (a2 + hi[:, None])
+        distances[outside] = torch.linalg.norm(y - closest, dim=-1)
+        return distances
+
+    def _rasterize_projected_gaussians(
+        self,
+        *,
+        raw_threshold: float,
+        occupied_threshold: float,
+        distance_iterations: int,
+        max_pair_chunk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        raw = torch.zeros(self.shape, dtype=torch.bool, device=self.device)
+        occupied = torch.zeros_like(raw)
+        if len(self.ellipses) == 0:
+            return raw, occupied
+
+        means = self.ellipses.means.detach().cpu().numpy()
+        covs = self.ellipses.covs.detach().cpu().numpy()
+        lower = (
+            self.lower_center - 0.5 * self.cell_sizes
+        ).detach().cpu().numpy()
+        cell = self.cell_sizes.detach().cpu().numpy()
+        max_extent = (
+            np.sqrt(
+                np.maximum(np.diagonal(covs, axis1=1, axis2=2), 0.0)
+            )
+            + occupied_threshold
+        )
+        min_center = means - max_extent
+        max_center = means + max_extent
+        lo = np.ceil((min_center - lower[None]) / cell[None] - 0.5).astype(
+            np.int64
+        )
+        hi = np.floor((max_center - lower[None]) / cell[None] - 0.5).astype(
+            np.int64
+        )
+        lo = np.maximum(lo, 0)
+        hi = np.minimum(
+            hi, np.asarray(self.shape, dtype=np.int64)[None] - 1
+        )
+
+        cell_chunks: list[np.ndarray] = []
+        ellipse_chunks: list[np.ndarray] = []
+        queued = 0
+
+        def flush() -> None:
+            nonlocal queued
+            if queued == 0:
+                return
+            cell_ids_np = np.concatenate(cell_chunks)
+            ellipse_ids_np = np.concatenate(ellipse_chunks)
+            for start in range(0, len(cell_ids_np), max_pair_chunk):
+                stop = min(start + max_pair_chunk, len(cell_ids_np))
+                cell_ids = torch.as_tensor(
+                    cell_ids_np[start:stop],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                ellipse_ids = torch.as_tensor(
+                    ellipse_ids_np[start:stop],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                points = self.xy_centers.reshape(-1, 2)[cell_ids]
+                distances = self.point_to_ellipse_distance(
+                    points,
+                    self.ellipses.means[ellipse_ids],
+                    self.ellipses.rots[ellipse_ids],
+                    self.ellipses.scales[ellipse_ids],
+                    distance_iterations,
+                )
+                raw.view(-1)[
+                    cell_ids[distances <= raw_threshold + 1e-12]
+                ] = True
+                occupied.view(-1)[
+                    cell_ids[distances <= occupied_threshold + 1e-12]
+                ] = True
+            cell_chunks.clear()
+            ellipse_chunks.clear()
+            queued = 0
+
+        ny = self.shape[1]
+        for ellipse_id in range(len(self.ellipses)):
+            if np.any(lo[ellipse_id] > hi[ellipse_id]):
+                continue
+            ix = np.arange(
+                lo[ellipse_id, 0], hi[ellipse_id, 0] + 1, dtype=np.int64
+            )
+            iy = np.arange(
+                lo[ellipse_id, 1], hi[ellipse_id, 1] + 1, dtype=np.int64
+            )
+            flat = (ix[:, None] * ny + iy[None, :]).reshape(-1)
+            cell_chunks.append(flat)
+            ellipse_chunks.append(
+                np.full(flat.shape, ellipse_id, dtype=np.int64)
+            )
+            queued += flat.size
+            if queued >= max_pair_chunk:
+                flush()
+        flush()
+        return raw, occupied
 
     def _make_disk_kernel(self, radius: float) -> torch.Tensor:
         """Build a conservative disk kernel for possibly non-square cells.
@@ -292,5 +557,9 @@ class GroundGrid:
             "projection_z_max": self.metadata.z_max,
             "reference_z": self.metadata.reference_z,
             "z_indices": list(self.metadata.z_indices),
+            "source": self.metadata.source,
+            "rasterization": self.metadata.rasterization,
+            "confidence": self.metadata.confidence,
+            "cell_circumradius": self.metadata.cell_circumradius,
             "search_backend": "native_2d_dijkstra_4_connected",
         }

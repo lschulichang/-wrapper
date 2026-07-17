@@ -115,6 +115,11 @@ def main():
     parser.add_argument("--max-segment-meters", type=float, default=1.0)
     parser.add_argument("--start", nargs=2, type=float, required=True)
     parser.add_argument("--goal", nargs=2, type=float, required=True)
+    parser.add_argument(
+        "--legacy-voxel-diagnostic",
+        action="store_true",
+        help="Build the former 3D-voxel projection only for comparison outputs",
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -142,14 +147,44 @@ def main():
     upper = torch.tensor(preset["upper_bound"], device=device)
     lower[2] = min(float(lower[2]), args.z_floor_scene)
     upper[2] = max(float(upper[2]), args.z_floor_scene + height)
+    z_min = float(args.z_floor_scene + clearance)
+    z_max = float(args.z_floor_scene + height)
 
     timings = {}
     t0 = time.time(); gsplat = GSplatLoader(args.config, device); sync(device); timings["gsplat_load"] = time.time() - t0
-    t0 = time.time(); voxel = GSplatVoxel(gsplat, lower, upper, preset["resolution"], 0.0, device); sync(device); timings["voxel"] = time.time() - t0
-    t0 = time.time(); grid = GroundGrid(
-        voxel, args.z_floor_scene, height, radius, ground_clearance=clearance, project_occupied_endpoints=False
-    ); sync(device); timings["height_projection_xy_dilation"] = time.time() - t0
-    t0 = time.time(); ellipses = PlanarGaussianSet.from_gsplat(gsplat, grid.metadata.z_min, grid.metadata.z_max); sync(device); timings["ellipse_projection"] = time.time() - t0
+    t0 = time.time(); ellipses = PlanarGaussianSet.from_gsplat(
+        gsplat, z_min, z_max, confidence=1.0
+    ); sync(device); timings["height_filter_full_projection"] = time.time() - t0
+    t0 = time.time(); grid = GroundGrid.from_projected_gaussians(
+        ellipses,
+        lower_xy=lower[:2],
+        upper_xy=upper[:2],
+        resolution_xy=preset["resolution"],
+        footprint_radius=radius,
+        z_floor_scene=args.z_floor_scene,
+        robot_height=height,
+        ground_clearance=clearance,
+        project_occupied_endpoints=False,
+    ); sync(device); timings["projected_ellipse_rasterization"] = time.time() - t0
+    legacy_grid = None
+    if args.legacy_voxel_diagnostic:
+        t0 = time.time()
+        voxel = GSplatVoxel(
+            gsplat, lower, upper, preset["resolution"], 0.0, device
+        )
+        sync(device)
+        timings["legacy_voxel"] = time.time() - t0
+        t0 = time.time()
+        legacy_grid = GroundGrid(
+            voxel,
+            args.z_floor_scene,
+            height,
+            radius,
+            ground_clearance=clearance,
+            project_occupied_endpoints=False,
+        )
+        sync(device)
+        timings["legacy_height_projection_xy_dilation"] = time.time() - t0
     collision_set = PlanarCollisionSet(
         ellipses, radius=radius, stopping_distance=stopping_distance, iterations=10
     )
@@ -201,7 +236,15 @@ def main():
     np.save(args.output_dir / "trajectory.npy", dense)
     np.savez_compressed(
         args.output_dir / "projected_gaussians.npz",
-        ids=ellipses.ids.detach().cpu().numpy(), means=ellipses.means.detach().cpu().numpy(), covs=ellipses.covs.detach().cpu().numpy(),
+        ids=ellipses.ids.detach().cpu().numpy(),
+        means=ellipses.means.detach().cpu().numpy(),
+        covs=ellipses.covs.detach().cpu().numpy(),
+        rots=ellipses.rots.detach().cpu().numpy(),
+        scales=ellipses.scales.detach().cpu().numpy(),
+        z_min=np.asarray(ellipses.z_min, dtype=np.float64),
+        z_max=np.asarray(ellipses.z_max, dtype=np.float64),
+        confidence=np.asarray(ellipses.confidence, dtype=np.float64),
+        projection_mode=np.asarray(ellipses.projection_mode),
     )
     np.savez_compressed(
         args.output_dir / "ground_grid.npz",
@@ -214,6 +257,12 @@ def main():
             float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])
         ], dtype=np.float64),
         scale=np.asarray(scale, dtype=np.float64),
+        source=np.asarray(grid.metadata.source),
+        rasterization=np.asarray(grid.metadata.rasterization),
+        footprint_radius_scene=np.asarray(radius, dtype=np.float64),
+        cell_circumradius_scene=np.asarray(
+            grid.metadata.cell_circumradius, dtype=np.float64
+        ),
     )
     (args.output_dir / "polygons.json").write_text(json.dumps(polygon_json, indent=2))
     (args.output_dir / "verification.json").write_text(json.dumps(verification, indent=2))
@@ -238,6 +287,11 @@ def main():
             "z_min": grid.metadata.z_min, "z_max": grid.metadata.z_max,
         },
         "gaussians_total": int(gsplat.means.shape[0]), "projected_ellipses": len(ellipses),
+        "map": {
+            **grid.summary(),
+            "projection_mode": ellipses.projection_mode,
+            "legacy_voxel_diagnostic": bool(args.legacy_voxel_diagnostic),
+        },
         "raw_seed_points": len(raw_seed), "simplified_seed_points": len(simplified),
         "polygon_count": len(corridor.polygons), "timings": timings,
         "qp_status": planner.last_solver_status, "failure_reason": None, "verification": verification,
@@ -248,15 +302,63 @@ def main():
     occupancy = grid.occupied.detach().cpu().numpy()
     extent = [float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])]
 
-    # Figure 1: the height-projected voxel map before and after XY disk dilation.
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
-    axes[0].imshow(raw_occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
-    axes[1].imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
-    configure_map_axis(axes[0], extent, "Uninflated 2D voxel obstacles")
-    configure_map_axis(axes[1], extent, "XY-dilated 2D voxel obstacles")
+    # Figure 1: one continuous source model and its two conservative grids.
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharex=True, sharey=True)
+    axes[0].add_collection(LineCollection(
+        projected_ellipse_polylines(ellipses),
+        colors="tab:red",
+        linewidths=0.25,
+        alpha=0.25,
+        rasterized=True,
+    ))
+    axes[1].imshow(raw_occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
+    axes[2].imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
+    configure_map_axis(axes[0], extent, "Height-filtered projected ellipses")
+    configure_map_axis(axes[1], extent, "Conservative ellipse rasterization")
+    configure_map_axis(axes[2], extent, "Robot-footprint search grid")
     fig.tight_layout()
-    fig.savefig(args.output_dir / "voxel_obstacles.png", dpi=180)
+    fig.savefig(args.output_dir / "planar_map_generation.png", dpi=180)
     plt.close(fig)
+
+    if legacy_grid is not None:
+        legacy_raw = legacy_grid.raw_occupied.detach().cpu().numpy()
+        legacy_occupied = legacy_grid.occupied.detach().cpu().numpy()
+        false_positive = legacy_occupied & ~occupancy
+        false_negative = ~legacy_occupied & occupancy
+        np.savez_compressed(
+            args.output_dir / "legacy_voxel_projection.npz",
+            raw_occupied=legacy_raw,
+            occupied=legacy_occupied,
+            extent=np.asarray(extent, dtype=np.float64),
+        )
+        comparison = {
+            "authority": "projected_gaussians",
+            "legacy_false_positive_cells": int(false_positive.sum()),
+            "legacy_false_negative_cells": int(false_negative.sum()),
+            "legacy_occupied_cells": int(legacy_occupied.sum()),
+            "projected_gaussian_occupied_cells": int(occupancy.sum()),
+        }
+        (args.output_dir / "map_model_comparison.json").write_text(
+            json.dumps(comparison, indent=2)
+        )
+        result["map"]["legacy_comparison"] = comparison
+        (args.output_dir / "result.json").write_text(json.dumps(result, indent=2))
+        fig, axes = plt.subplots(2, 2, figsize=(12, 11), sharex=True, sharey=True)
+        layers = (
+            (legacy_occupied, "Legacy 3D-voxel projection", "Greys"),
+            (occupancy, "Projected-Gaussian search grid", "Greys"),
+            (false_positive, "Legacy false positives", "Reds"),
+            (false_negative, "Legacy false negatives", "Blues"),
+        )
+        for axis, (layer, title, cmap) in zip(axes.ravel(), layers):
+            axis.imshow(
+                layer.T, origin="lower", extent=extent, cmap=cmap,
+                aspect="equal", interpolation="nearest",
+            )
+            configure_map_axis(axis, extent, title)
+        fig.tight_layout()
+        fig.savefig(args.output_dir / "legacy_map_comparison.png", dpi=180)
+        plt.close(fig)
 
     # Figure 2: the direct 2D Dijkstra path and its deterministic LOS simplification.
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -266,7 +368,7 @@ def main():
         simplified[:, 0], simplified[:, 1], "o--", color="tab:orange", linewidth=1.8,
         markersize=4.5, label="LOS simplified",
     )
-    configure_map_axis(ax, extent, "Inflated voxel map and 2D seed paths")
+    configure_map_axis(ax, extent, "Projected-Gaussian search grid and 2D seed paths")
     ax.legend()
     fig.tight_layout()
     fig.savefig(args.output_dir / "dijkstra_and_simplified_path.png", dpi=180)

@@ -30,11 +30,12 @@ python "$ROOT/scripts/smoke_ground_corridor_2d.py" \
 cat > "$RUN_DIR/notes.md" <<EOF
 # Notes
 
-- Goal: direct 2D Dijkstra, projected Gaussian ellipses, paper-style 2D separating lines, convex corridor, and 2D Bezier QP.
+- Goal: height-filtered projected Gaussian ellipses are the authoritative source for the conservative 2D search grid, paper-style separating lines, convex corridor, and 2D Bezier QP.
 - Robot: 15 cm projected circle; no circumscribed sphere.
+- Search map: cells are conservatively occupied using exact point-to-ellipse distance plus the cell circumradius and robot footprint; the normal run does not build a 3D GS voxel grid.
 - Collision-set box: stopping distance is computed as vmax^2/(2*max_brake_decel) = 6.67 cm; the unshrunk half-width is robot radius + stopping distance.
 - Path simplification uses only the conservative inflated-grid line-of-sight condition; exact circle-ellipse collision is a separate consistency verification.
-- Figures: voxel_obstacles.png compares raw/dilated voxels; dijkstra_and_simplified_path.png shows both seed paths; projected_ellipses_corridor_bezier.png shows the continuous planar geometry and optimized trajectory.
+- Figures: planar_map_generation.png shows projected ellipses and both conservative grids; dijkstra_and_simplified_path.png shows both seed paths; projected_ellipses_corridor_bezier.png shows the continuous planar geometry and optimized trajectory.
 - Result: see assets/result.json and assets/verification.json.
 EOF
 echo "run_dir=$RUN_DIR"

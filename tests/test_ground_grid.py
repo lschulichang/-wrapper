@@ -14,6 +14,7 @@ UPSTREAM = ROOT / "splatnav-official"
 sys.path.insert(0, str(UPSTREAM))
 
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
+from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from initialization.grid_utils import GSplatVoxel  # noqa: E402
 
 
@@ -40,6 +41,21 @@ def fake_voxel() -> SimpleNamespace:
         grid_centers=centers,
         cell_sizes=cell_sizes,
         radius=0.0,
+    )
+
+
+def ellipse_set(device=torch.device("cpu"), scale=1.0) -> PlanarGaussianSet:
+    dtype = torch.float64
+    scales = torch.tensor([[0.20, 0.10]], dtype=dtype, device=device) * scale
+    return PlanarGaussianSet(
+        ids=torch.tensor([0], dtype=torch.long, device=device),
+        means=torch.tensor([[0.0, 0.0]], dtype=dtype, device=device),
+        covs=torch.diag_embed(scales.square()),
+        rots=torch.eye(2, dtype=dtype, device=device).unsqueeze(0),
+        scales=scales,
+        z_min=0.02 * scale,
+        z_max=0.10 * scale,
+        confidence=1.0,
     )
 
 
@@ -142,6 +158,85 @@ class GroundGridTest(unittest.TestCase):
         )
         self.assertEqual(tuple(voxel.non_navigable_grid.shape), (5, 5, 5))
         self.assertGreater(int(voxel.non_navigable_grid.sum()), 0)
+
+    def test_point_to_axis_aligned_ellipse_distance(self) -> None:
+        points = torch.tensor(
+            [[0.0, 0.0], [2.0, 0.0], [0.0, 3.0]], dtype=torch.float64
+        )
+        means = torch.zeros_like(points)
+        rotations = torch.eye(2, dtype=torch.float64).repeat(3, 1, 1)
+        scales = torch.tensor(
+            [[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]], dtype=torch.float64
+        )
+        distances = GroundGrid.point_to_ellipse_distance(
+            points, means, rotations, scales
+        )
+        torch.testing.assert_close(
+            distances, torch.tensor([0.0, 1.0, 1.0], dtype=torch.float64),
+            atol=1e-9, rtol=1e-9,
+        )
+
+    def test_point_to_ellipse_distance_is_rotation_invariant(self) -> None:
+        point = torch.tensor([[2.0, 0.0]], dtype=torch.float64)
+        means = torch.zeros_like(point)
+        identity = torch.eye(2, dtype=torch.float64).unsqueeze(0)
+        quarter_turn = torch.tensor(
+            [[[0.0, -1.0], [1.0, 0.0]]], dtype=torch.float64
+        )
+        scales = torch.tensor([[1.0, 0.5]], dtype=torch.float64)
+        first = GroundGrid.point_to_ellipse_distance(
+            point, means, identity, scales
+        )
+        rotated_point = torch.tensor([[0.0, 2.0]], dtype=torch.float64)
+        second = GroundGrid.point_to_ellipse_distance(
+            rotated_point, means, quarter_turn, scales
+        )
+        torch.testing.assert_close(first, second, atol=1e-9, rtol=1e-9)
+
+    def test_projected_gaussian_rasterization_is_conservative_and_deterministic(self) -> None:
+        kwargs = dict(
+            ellipses=ellipse_set(),
+            lower_xy=(-1.0, -1.0),
+            upper_xy=(1.0, 1.0),
+            resolution_xy=(40, 40),
+            footprint_radius=0.15,
+        )
+        first = GroundGrid.from_projected_gaussians(**kwargs)
+        second = GroundGrid.from_projected_gaussians(**kwargs)
+        self.assertTrue(torch.all(first.raw_occupied <= first.occupied))
+        self.assertGreater(int(first.raw_occupied.sum()), 0)
+        self.assertGreater(
+            int(first.occupied.sum()), int(first.raw_occupied.sum())
+        )
+        torch.testing.assert_close(first.raw_occupied, second.raw_occupied)
+        torch.testing.assert_close(first.occupied, second.occupied)
+        self.assertEqual(first.metadata.source, "projected_gaussians")
+        self.assertEqual(
+            first.metadata.rasterization,
+            "center_distance_plus_cell_circumradius",
+        )
+
+    def test_projected_gaussian_grid_is_scene_scale_invariant(self) -> None:
+        base = GroundGrid.from_projected_gaussians(
+            ellipse_set(scale=1.0), (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15
+        )
+        scaled = GroundGrid.from_projected_gaussians(
+            ellipse_set(scale=2.0), (-2.0, -2.0), (2.0, 2.0), (40, 40), 0.30
+        )
+        torch.testing.assert_close(base.raw_occupied, scaled.raw_occupied)
+        torch.testing.assert_close(base.occupied, scaled.occupied)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_projected_gaussian_grid_matches_cpu_and_gpu(self) -> None:
+        cpu = GroundGrid.from_projected_gaussians(
+            ellipse_set(), (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15
+        )
+        gpu = GroundGrid.from_projected_gaussians(
+            ellipse_set(torch.device("cuda")),
+            (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15,
+        )
+        torch.testing.assert_close(cpu.raw_occupied, gpu.raw_occupied.cpu())
+        torch.testing.assert_close(cpu.occupied, gpu.occupied.cpu())
 
 
 if __name__ == "__main__":

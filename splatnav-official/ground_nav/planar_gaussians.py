@@ -17,6 +17,7 @@ class PlanarGaussianSet:
     z_min: float
     z_max: float
     confidence: float
+    projection_mode: str = "height_filter_full_projection"
 
     @classmethod
     def from_gsplat(cls, gsplat, z_min: float, z_max: float, confidence: float = 1.0):
@@ -28,6 +29,8 @@ class PlanarGaussianSet:
         mask = ((gsplat.means[:, 2] + z_sigma) > z_min) & ((gsplat.means[:, 2] - z_sigma) < z_max)
         ids = torch.arange(gsplat.means.shape[0], device=gsplat.means.device)[mask]
         covs = gsplat.covs[mask, :2, :2] * confidence**2
+        if not bool(torch.all(torch.isfinite(covs)).item()):
+            raise ValueError("projected Gaussian covariances must be finite")
         eigenvalues, eigenvectors = torch.linalg.eigh(covs)
         eigenvalues = torch.clamp(eigenvalues, min=1e-12)
         return cls(
@@ -39,6 +42,7 @@ class PlanarGaussianSet:
             z_min=float(z_min),
             z_max=float(z_max),
             confidence=float(confidence),
+            projection_mode="height_filter_full_projection",
         )
 
     def __len__(self) -> int:

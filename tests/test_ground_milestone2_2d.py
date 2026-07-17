@@ -88,6 +88,16 @@ class Milestone2DTest(unittest.TestCase):
         self.assertEqual(len(projected), 1)
         np.testing.assert_allclose(projected.means.numpy(), [[1.0, 2.0]])
         np.testing.assert_allclose(projected.covs.numpy(), covs[:1, :2, :2].numpy())
+        self.assertEqual(projected.projection_mode, "height_filter_full_projection")
+
+    def test_height_filter_excludes_zero_volume_boundary_contact(self):
+        covariance = torch.diag(torch.tensor([0.04, 0.04, 0.01])).repeat(2, 1, 1)
+        gsplat = SimpleNamespace(
+            means=torch.tensor([[0.0, 0.0, 0.10], [1.0, 0.0, 0.1001]]),
+            covs=covariance,
+        )
+        projected = PlanarGaussianSet.from_gsplat(gsplat, 0.20, 0.30)
+        self.assertEqual(projected.ids.tolist(), [1])
 
     def test_rotated_rectangle_is_deterministic_and_contains_segment(self):
         segment = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
