@@ -23,7 +23,6 @@ sys.path.insert(0, str(UPSTREAM))
 
 from ground_nav.corridor_2d import PlanarCollisionSet  # noqa: E402
 from ground_nav.kanayama_controller import KanayamaController  # noqa: E402
-from ground_nav.path_utils import line_of_sight_free  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from ground_nav.timed_trajectory import TimedTrajectory  # noqa: E402
 from ground_nav.unicycle_model import UnicycleModel  # noqa: E402
@@ -32,26 +31,6 @@ from smoke_ground_corridor_2d import (  # noqa: E402
     polygon_vertices,
     projected_ellipse_polylines,
 )
-
-
-class SavedGroundGrid:
-    """The minimal GroundGrid interface required for continuous LOS checks."""
-
-    def __init__(self, archive):
-        self.occupied = torch.as_tensor(archive["occupied"], dtype=torch.bool)
-        self.cell_sizes = torch.as_tensor(archive["cell_sizes"], dtype=torch.float64)
-        self.lower_center = torch.as_tensor(archive["lower_center"], dtype=torch.float64)
-        self.shape = tuple(int(value) for value in archive["shape"])
-
-    def world_to_grid(self, point):
-        point = torch.as_tensor(point, dtype=torch.float64).flatten()[:2]
-        index = torch.round((point - self.lower_center) / self.cell_sizes).to(torch.long)
-        maximum = torch.tensor(self.shape, dtype=torch.long) - 1
-        return torch.minimum(torch.maximum(index, torch.zeros_like(index)), maximum)
-
-    def grid_to_world(self, index):
-        index = torch.as_tensor(index, dtype=torch.float64).flatten()[:2]
-        return self.lower_center + index * self.cell_sizes
 
 
 def load_polygons(path: Path):
@@ -108,14 +87,13 @@ def corridor_statistics(points, polygons, scale, tolerance=1e-6):
     }
 
 
-def segment_safety_flags(points, collision_set, grid):
-    exact_flags, grid_flags = [], []
+def continuous_safety_flags(points, collision_set):
+    exact_flags = []
     with torch.no_grad():
         for first, second in zip(points[:-1], points[1:]):
             segment = np.stack([first, second])
             exact_flags.append(collision_set.segment_is_safe(segment))
-            grid_flags.append(line_of_sight_free(grid, first, second))
-    return np.asarray(exact_flags, dtype=bool), np.asarray(grid_flags, dtype=bool)
+    return np.asarray(exact_flags, dtype=bool)
 
 
 def flag_statistics(flags):
@@ -313,6 +291,12 @@ def main():
     save_json(assets / "planning_result.json", planning_result)
     save_json(assets / "planning_verification.json", planning_verification)
     scale = float(planning_result["scale"])
+    planning_max_speed = planning_result.get("physical", {}).get("max_speed_mps")
+    if planning_max_speed is not None and not np.isclose(args.max_speed_mps, planning_max_speed):
+        raise ValueError(
+            "milestone-4 max-speed-mps must match the speed used to construct "
+            f"the milestone-2 stopping-distance corridor ({planning_max_speed})"
+        )
     try:
         trajectory = TimedTrajectory.from_bezier(
             np.load(assets / "control_points.npy"),
@@ -379,21 +363,25 @@ def main():
 
     polygons = load_polygons(assets / "polygons.json")
     grid_archive = np.load(assets / "ground_grid.npz")
-    grid = SavedGroundGrid(grid_archive)
     extent = np.asarray(grid_archive["extent"], dtype=np.float64).tolist()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ellipses = load_projected_ellipses(assets / "projected_gaussians.npz", planning_result, device)
+    stopping_distance = float(
+        planning_result["scene_units"].get(
+            "stopping_distance", planning_result["scene_units"]["corridor_margin"]
+        )
+    )
     collision_set = PlanarCollisionSet(
         ellipses,
         radius=float(planning_result["scene_units"]["circle_radius"]),
-        corridor_margin=float(planning_result["scene_units"]["corridor_margin"]),
+        stopping_distance=stopping_distance,
         iterations=10,
     )
-    reference_exact_flags, reference_grid_flags = segment_safety_flags(
-        trajectory.data[:, 1:3], collision_set, grid
+    reference_exact_flags = continuous_safety_flags(
+        trajectory.data[:, 1:3], collision_set
     )
-    execution_exact_flags, execution_grid_flags = segment_safety_flags(
-        executed[:, 1:3], collision_set, grid
+    execution_exact_flags = continuous_safety_flags(
+        executed[:, 1:3], collision_set
     )
     reference_corridor_flags, reference_corridor = corridor_statistics(
         trajectory.data[:, 1:3], polygons, scale
@@ -401,9 +389,8 @@ def main():
     execution_corridor_flags, execution_corridor = corridor_statistics(
         executed[:, 1:3], polygons, scale
     )
-    # Red crosses represent a violation of the continuous geometry model or the
-    # reference corridor. The inflated grid is a conservative seed-search model
-    # and is reported separately instead of being mislabeled as a collision.
+    # Red crosses represent a violation of the authoritative continuous
+    # geometry model or the reference corridor.
     bad_points = set(np.flatnonzero(~execution_corridor_flags).tolist())
     bad_points.update((np.flatnonzero(~execution_exact_flags) + 1).tolist())
 
@@ -434,10 +421,8 @@ def main():
         "final_position_error_m": float(errors[-1, 4]),
         "final_heading_error_rad": final_heading_error,
         "reference_continuous_ellipse_safe": bool(np.all(reference_exact_flags)),
-        "reference_inflated_grid_safe": bool(np.all(reference_grid_flags)),
         "reference_inside_corridor": bool(np.all(reference_corridor_flags)),
         "continuous_ellipse_safe": bool(np.all(execution_exact_flags)),
-        "inflated_grid_safe": bool(np.all(execution_grid_flags)),
         "inside_corridor": bool(np.all(execution_corridor_flags)),
         "corridor": {
             "reference": reference_corridor,
@@ -446,15 +431,12 @@ def main():
         "segment_checks": {
             "reference": {
                 "continuous_projected_ellipses": flag_statistics(reference_exact_flags),
-                "inflated_grid": flag_statistics(reference_grid_flags),
             },
             "execution": {
                 "continuous_projected_ellipses": flag_statistics(execution_exact_flags),
-                "inflated_grid": flag_statistics(execution_grid_flags),
             },
         },
         "safety_model_roles": {
-            "inflated_grid": "conservative milestone-2 seed-search diagnostic",
             "safety_polygons": "hard constraint for the milestone-2 Bezier reference; execution diagnostic without a tracking tube",
             "projected_ellipses": "authoritative continuous collision model for reference and execution",
         },
@@ -488,8 +470,6 @@ def main():
         "reached_goal": tracking_result["reached_goal"],
     }
     diagnostic_verification = {
-        "reference_inflated_grid_safe": tracking_result["reference_inflated_grid_safe"],
-        "execution_inflated_grid_safe": tracking_result["inflated_grid_safe"],
         "execution_inside_reference_corridor": tracking_result["inside_corridor"],
     }
     accepted = all(required_verification.values())

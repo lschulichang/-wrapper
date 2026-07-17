@@ -26,7 +26,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(UPSTREAM))
 
 from ground_nav.bezier_2d import BezierPlanner2D  # noqa: E402
-from ground_nav.corridor_2d import PlanarCollisionSet, build_planar_corridor  # noqa: E402
+from ground_nav.corridor_2d import (  # noqa: E402
+    PlanarCollisionSet,
+    build_planar_corridor,
+    compute_stopping_distance,
+)
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from ground_nav.path_utils import (  # noqa: E402
     merge_collinear_ground_path,
@@ -154,25 +158,22 @@ def generate_candidate_paths(grid, endpoint_indices, scale, count, min_distance_
     return candidates, {"sampling_attempts": attempts, "candidate_count": len(candidates)}
 
 
-def exact_candidate_valid(candidate, collision_set):
-    path = candidate["raw_path"]
-    checks = [path[[0, 0]], path[[-1, -1]]]
-    checks.extend(np.stack([path[:-1], path[1:]], axis=1))
-    for segment in checks:
-        if not collision_set.segment_is_safe(segment):
-            return False
-    return True
+def select_stratified_candidates(candidates, sample_count):
+    """Select paired trials using only inflated-grid path properties.
 
+    The projected and footprint-dilated occupancy grid is the safety model for
+    Dijkstra and path simplification.  Deliberately do not pre-filter complete
+    raw paths with the continuous circle--ellipse test; the exact geometry is
+    retained where it is required to build corridor separating lines and to
+    verify the final Bezier trajectory.
+    """
 
-def select_stratified_candidates(candidates, collision_set, sample_count, device):
     if sample_count % 3 != 0:
         raise ValueError("sample_count must be divisible by three")
     ordered = sorted(candidates, key=lambda row: (row["raw_turn_count"], row["raw_path_length_m"]))
     layers = np.array_split(np.asarray(ordered, dtype=object), 3)
     per_layer = sample_count // 3
     selected = []
-    excluded = []
-    cache = {}
     labels = ("low", "medium", "high")
     for label, values in zip(labels, layers):
         values = sorted(values.tolist(), key=lambda row: row["raw_path_length_m"])
@@ -187,13 +188,6 @@ def select_stratified_candidates(candidates, collision_set, sample_count, device
                 candidate_id = candidate["candidate_id"]
                 if candidate_id in used or any(row["candidate_id"] == candidate_id for row in selected):
                     continue
-                if candidate_id not in cache:
-                    cache[candidate_id] = exact_candidate_valid(candidate, collision_set)
-                    sync(device)
-                if not cache[candidate_id]:
-                    excluded.append({"candidate_id": candidate_id, "reason": "endpoint_or_raw_path_exact_collision"})
-                    used.add(candidate_id)
-                    continue
                 chosen = dict(candidate)
                 chosen["complexity_layer"] = label
                 chosen["length_target_quantile"] = float(target)
@@ -204,7 +198,7 @@ def select_stratified_candidates(candidates, collision_set, sample_count, device
                 raise RuntimeError(f"could not select {per_layer} exact-safe samples for {label} layer")
     for index, row in enumerate(selected):
         row["trial_id"] = f"trial_{index:03d}"
-    return selected, excluded
+    return selected
 
 
 def choose_simplified_path(strategy, raw_path, grid, max_segment_scene):
@@ -312,15 +306,6 @@ def run_variant(candidate, strategy, grid, collision_set, scale, max_segment_sce
             "max_segment_length_m": float(np.max(lengths) / scale),
         })
 
-        stage = "seed_exact_verification"
-        segments = np.stack([simplified[:-1], simplified[1:]], axis=1)
-        sync(device); start_time = time.perf_counter()
-        seed_flags = [collision_set.segment_is_safe(segment) for segment in segments]
-        sync(device); record["time_seed_exact_s"] = time.perf_counter() - start_time
-        record["seed_exact_safe"] = bool(all(seed_flags))
-        if not all(seed_flags):
-            raise RuntimeError(f"unsafe simplified segments: {np.flatnonzero(~np.asarray(seed_flags)).tolist()}")
-
         stage = "corridor"
         sync(device); start_time = time.perf_counter()
         corridor = build_planar_corridor(simplified, collision_set)
@@ -365,13 +350,11 @@ def run_variant(candidate, strategy, grid, collision_set, scale, max_segment_sce
         record.update(bezier_quality(controls, dense, scale))
         record["time_downstream_s"] = float(
             record["time_simplification_s"]
-            + record["time_seed_exact_s"]
             + record["time_corridor_s"]
             + record["time_qp_s"]
         )
         record["time_after_simplification_s"] = float(
-            record["time_seed_exact_s"]
-            + record["time_corridor_s"]
+            record["time_corridor_s"]
             + record["time_qp_s"]
         )
         record["success"] = True
@@ -380,7 +363,7 @@ def run_variant(candidate, strategy, grid, collision_set, scale, max_segment_sce
         record["failure_stage"] = stage
         record["failure_reason"] = str(error)
         present = [record.get(key, 0.0) for key in (
-            "time_simplification_s", "time_seed_exact_s", "time_corridor_s", "time_qp_s"
+            "time_simplification_s", "time_corridor_s", "time_qp_s"
         )]
         record["time_downstream_s"] = float(sum(present))
     return record, artifact
@@ -435,7 +418,7 @@ def paired_statistics(records):
 
 def build_summary(records, sample_count, seed):
     metrics = (
-        "time_simplification_s", "time_seed_exact_s", "time_corridor_s", "time_qp_s",
+        "time_simplification_s", "time_corridor_s", "time_qp_s",
         "time_downstream_s", "time_after_simplification_s", "simplified_point_count",
         "polygon_count", "candidate_gaussian_total",
         "halfspace_total", "bezier_length_m", "max_abs_curvature_1pm",
@@ -446,7 +429,12 @@ def build_summary(records, sample_count, seed):
         rows = [row for row in records if row["strategy"] == strategy]
         successful = [row for row in rows if row["success"]]
         collision_failures = sum(
-            row.get("failure_stage") in ("seed_exact_verification", "dense_exact_verification") for row in rows
+            row.get("failure_stage") == "dense_exact_verification"
+            or (
+                row.get("failure_stage") == "corridor"
+                and "not circle-ellipse safe" in (row.get("failure_reason") or "")
+            )
+            for row in rows
         )
         summary["strategies"][strategy] = {
             "success_count": len(successful),
@@ -487,9 +475,6 @@ def build_summary(records, sample_count, seed):
 
 
 def save_records(output_dir, records):
-    with (output_dir / "trial_records.jsonl").open("w", encoding="utf-8") as handle:
-        for row in records:
-            handle.write(json.dumps(row, ensure_ascii=False, default=json_default) + "\n")
     scalar_keys = sorted({key for row in records for key, value in row.items() if np.isscalar(value) or value is None})
     with (output_dir / "paired_metrics.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=scalar_keys)
@@ -508,7 +493,7 @@ def plot_timing(output_dir, records):
         axes[0].text(0.5, 0.5, "insufficient successful runs", ha="center", va="center")
         axes[0].set_xticks(range(1, len(STRATEGIES) + 1), STRATEGIES)
     axes[0].set(ylabel="time [s]", title="Paired downstream time")
-    components = ("time_simplification_s", "time_seed_exact_s", "time_corridor_s", "time_qp_s")
+    components = ("time_simplification_s", "time_corridor_s", "time_qp_s")
     bottoms = np.zeros(len(STRATEGIES))
     for component in components:
         values = np.array([
@@ -600,7 +585,14 @@ def main():
     parser.add_argument("--robot-height-meters", type=float, default=0.10)
     parser.add_argument("--footprint-radius-meters", type=float, default=0.15)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.02)
-    parser.add_argument("--corridor-margin-meters", type=float, default=0.10)
+    parser.add_argument("--max-speed-mps", type=float, default=0.20)
+    parser.add_argument("--max-brake-decel-mps2", type=float, default=0.30)
+    parser.add_argument(
+        "--corridor-margin-meters",
+        type=float,
+        default=None,
+        help="Deprecated manual override; default is vmax^2/(2*max_brake_decel)",
+    )
     parser.add_argument("--max-segment-meters", type=float, default=1.0)
     parser.add_argument("--endpoint-clearance-meters", type=float, default=0.05)
     parser.add_argument("--min-distance-meters", type=float, default=2.0)
@@ -628,7 +620,18 @@ def main():
     height = args.robot_height_meters * scale
     radius = args.footprint_radius_meters * scale
     clearance = args.ground_clearance_meters * scale
-    margin = args.corridor_margin_meters * scale
+    computed_stopping_distance_m = compute_stopping_distance(
+        args.max_speed_mps, args.max_brake_decel_mps2
+    )
+    if args.corridor_margin_meters is None:
+        stopping_distance_m = computed_stopping_distance_m
+        stopping_distance_source = "vmax_squared_over_2_brake_decel"
+    else:
+        if args.corridor_margin_meters < 0.0:
+            raise ValueError("corridor-margin-meters must be non-negative")
+        stopping_distance_m = float(args.corridor_margin_meters)
+        stopping_distance_source = "manual_corridor_margin_override"
+    stopping_distance = stopping_distance_m * scale
     maximum_segment = args.max_segment_meters * scale
     preset = SCENE_PRESETS[args.scene]
     lower = torch.tensor(preset["lower_bound"], device=device)
@@ -648,7 +651,9 @@ def main():
     start_time = time.perf_counter(); ellipses = PlanarGaussianSet.from_gsplat(
         gsplat, grid.metadata.z_min, grid.metadata.z_max
     ); sync(device); preprocessing["ellipse_projection_s"] = time.perf_counter() - start_time
-    collision_set = PlanarCollisionSet(ellipses, radius=radius, corridor_margin=margin, iterations=10)
+    collision_set = PlanarCollisionSet(
+        ellipses, radius=radius, stopping_distance=stopping_distance, iterations=10
+    )
 
     endpoint_indices, component_info = largest_component_endpoints(
         grid, scale, args.endpoint_clearance_meters
@@ -659,10 +664,8 @@ def main():
     )
     preprocessing["candidate_generation_s"] = time.perf_counter() - start_time
     start_time = time.perf_counter()
-    selected, excluded = select_stratified_candidates(
-        candidates, collision_set, args.sample_count, device
-    )
-    preprocessing["candidate_exact_selection_s"] = time.perf_counter() - start_time
+    selected = select_stratified_candidates(candidates, args.sample_count)
+    preprocessing["candidate_selection_s"] = time.perf_counter() - start_time
 
     # Preserve the fixed old_union pair used by milestones 2/4 as a separate
     # reproducibility anchor.  It is intentionally excluded from the paired
@@ -676,7 +679,7 @@ def main():
         "start_grid": grid.world_to_grid(baseline_start).detach().cpu().tolist(),
         "goal_grid": grid.world_to_grid(baseline_goal).detach().cpu().tolist(),
         "raw_path": baseline_path.tolist(),
-        "exact_safe": exact_candidate_valid({"raw_path": baseline_path}, collision_set),
+        "complete_path_exact_prefiltered": False,
         "included_in_statistics": False,
         **path_metrics(baseline_path, scale),
     }
@@ -692,7 +695,6 @@ def main():
         "seed": args.seed, "component": component_info, "sampling": sampling_info, "pairs": candidate_json,
     })
     save_json(args.output_dir / "selected_pairs.json", selected_json)
-    save_json(args.output_dir / "excluded_pairs.json", excluded)
     save_json(args.output_dir / "fixed_baseline_pair.json", baseline)
 
     representatives = []
@@ -740,12 +742,22 @@ def main():
             "robot_height_m": args.robot_height_meters,
             "footprint_radius_m": args.footprint_radius_meters,
             "ground_clearance_m": args.ground_clearance_meters,
-            "corridor_margin_m": args.corridor_margin_meters,
+            "max_speed_mps": args.max_speed_mps,
+            "max_brake_decel_mps2": args.max_brake_decel_mps2,
+            "computed_stopping_distance_m": computed_stopping_distance_m,
+            "stopping_distance_m": stopping_distance_m,
+            "stopping_distance_source": stopping_distance_source,
+            "corridor_margin_m": stopping_distance_m,
             "max_segment_m": args.max_segment_meters,
             "endpoint_clearance_m": args.endpoint_clearance_meters,
             "minimum_endpoint_distance_m": args.min_distance_meters,
         },
-        "dataset": {**component_info, **sampling_info, "selected_count": len(selected), "excluded_exact_count": len(excluded)},
+        "dataset": {
+            **component_info,
+            **sampling_info,
+            "selected_count": len(selected),
+            "complete_path_exact_prefilter_enabled": False,
+        },
     })
     save_json(args.output_dir / "summary.json", summary)
     failures = [row for row in records if not row["success"]]

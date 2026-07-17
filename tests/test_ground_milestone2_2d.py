@@ -17,6 +17,7 @@ from ground_nav.bezier_2d import BezierPlanner2D  # noqa: E402
 from ground_nav.corridor_2d import (  # noqa: E402
     PlanarCollisionSet,
     build_planar_corridor,
+    compute_stopping_distance,
     compute_rotated_rectangle,
     continuous_circle_ellipse_test,
 )
@@ -39,8 +40,8 @@ class FakeGrid:
 
 
 def ellipse_set(means, scales):
-    means = torch.tensor(means, dtype=torch.float32)
-    scales = torch.tensor(scales, dtype=torch.float32)
+    means = torch.tensor(means, dtype=torch.float32).reshape(-1, 2)
+    scales = torch.tensor(scales, dtype=torch.float32).reshape(-1, 2)
     count = means.shape[0]
     rots = torch.eye(2).repeat(count, 1, 1)
     return PlanarGaussianSet(
@@ -50,6 +51,33 @@ def ellipse_set(means, scales):
 
 
 class Milestone2DTest(unittest.TestCase):
+    def test_stopping_distance_and_collision_box_extent(self):
+        stopping_distance = compute_stopping_distance(0.20, 0.30)
+        self.assertAlmostEqual(stopping_distance, 1.0 / 15.0)
+        with self.assertRaises(ValueError):
+            compute_stopping_distance(0.20, 0.0)
+
+        ellipses = ellipse_set([], [])
+        collision_set = PlanarCollisionSet(
+            ellipses, radius=0.15, stopping_distance=stopping_distance
+        )
+        segment = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+        data = collision_set.candidates(segment)
+        outer_extents = data["b_box"] - data["A_box"] @ data["midpoint"]
+        center_extents = data["b_box_shrunk"] - data["A_box"] @ data["midpoint"]
+        np.testing.assert_allclose(
+            outer_extents.numpy(),
+            [0.5 + 0.15 + stopping_distance, 0.15 + stopping_distance,
+             0.5 + 0.15 + stopping_distance, 0.15 + stopping_distance],
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            center_extents.numpy(),
+            [0.5 + stopping_distance, stopping_distance,
+             0.5 + stopping_distance, stopping_distance],
+            atol=1e-7,
+        )
+
     def test_height_filter_and_orthogonal_projection(self):
         covs = torch.tensor([
             [[4.0, 1.0, 0.2], [1.0, 2.0, 0.1], [0.2, 0.1, 0.04]],

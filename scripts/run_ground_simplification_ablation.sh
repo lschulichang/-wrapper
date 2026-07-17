@@ -5,6 +5,8 @@ ROOT="/home/howard/Splat-Nav"
 CONDA_ROOT="/data/howard/miniconda3"
 TOPIC="ground_simplification_ablation_old_union"
 CONFIG="$ROOT/splatnav-official/outputs/old_union2/splatfacto/2024-09-02_151414/config.yml"
+MAX_SPEED_MPS="0.20"
+MAX_BRAKE_DECEL_MPS2="0.30"
 
 cd "$ROOT"
 RUN_DIR="$(scripts/create_run_dir.sh "$TOPIC")"
@@ -17,7 +19,8 @@ COMMAND=(
   --robot-height-meters 0.10
   --footprint-radius-meters 0.15
   --ground-clearance-meters 0.02
-  --corridor-margin-meters 0.10
+  --max-speed-mps "$MAX_SPEED_MPS"
+  --max-brake-decel-mps2 "$MAX_BRAKE_DECEL_MPS2"
   --max-segment-meters 1.0
   --endpoint-clearance-meters 0.05
   --min-distance-meters 2.0
@@ -57,6 +60,10 @@ cat > "$RUN_DIR/notes.md" <<'EOF'
 - C: current sampled inflated-grid LOS simplification, with the shared 1 m cap.
 - D: integer supercover inflated-grid LOS simplification, with the shared 1 m cap.
 - The same raw Dijkstra path is reused for A/B/C/D for every selected endpoint pair.
+- Complete raw and simplified paths are not pre-verified by a separate circle--ellipse pass.
+- Exact circle--ellipse geometry remains inside corridor construction for separating lines.
+- Dense final Bezier chords retain continuous circle--ellipse verification.
+- Collision-set boxes use the computed stopping distance vmax^2/(2*max_brake_decel) = 6.67 cm instead of a fixed 10 cm margin.
 - Thirty pairs are sampled from the largest inflated-grid free component and stratified into low/medium/high raw-turn terciles.
 - The fixed milestone 2/4 endpoint pair is saved separately and is not included in the paired statistics.
 - Primary downstream time excludes map/GS loading and candidate generation.

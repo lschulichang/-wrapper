@@ -10,6 +10,18 @@ import torch
 from ellipsoids.intersection_utils import compute_K_parameters_sphere, compute_sphere_ellipsoid_Q
 
 
+def compute_stopping_distance(max_speed: float, max_brake_deceleration: float) -> float:
+    """Return the constant-deceleration stopping distance in consistent units."""
+
+    max_speed = float(max_speed)
+    max_brake_deceleration = float(max_brake_deceleration)
+    if max_speed < 0.0:
+        raise ValueError("max_speed must be non-negative")
+    if max_brake_deceleration <= 0.0:
+        raise ValueError("max_brake_deceleration must be positive")
+    return max_speed**2 / (2.0 * max_brake_deceleration)
+
+
 def compute_rotated_rectangle(segment: torch.Tensor, half_margin: float):
     delta = segment[1] - segment[0]
     length = torch.linalg.norm(delta)
@@ -83,12 +95,36 @@ def continuous_circle_ellipse_test(segment, rots, scales, means, radius: float, 
 
 
 class PlanarCollisionSet:
-    def __init__(self, ellipses, radius: float, corridor_margin: float, iterations: int = 10):
-        if radius < 0 or corridor_margin < 0:
-            raise ValueError("radius and corridor_margin must be non-negative")
+    def __init__(
+        self,
+        ellipses,
+        radius: float,
+        corridor_margin: float | None = None,
+        iterations: int = 10,
+        *,
+        stopping_distance: float | None = None,
+    ):
+        """Construct a paper-style local collision set.
+
+        ``stopping_distance`` is the preferred name for the post-footprint
+        corridor extent. ``corridor_margin`` remains as a compatibility alias.
+        The unshrunk candidate box uses ``radius + stopping_distance``; after
+        shrinking its faces by ``radius``, the seed segment retains exactly the
+        stopping-distance extent used by the original Splat-Plan construction.
+        """
+
+        if stopping_distance is None:
+            if corridor_margin is None:
+                raise ValueError("stopping_distance is required")
+            stopping_distance = corridor_margin
+        elif corridor_margin is not None and not np.isclose(corridor_margin, stopping_distance):
+            raise ValueError("corridor_margin and stopping_distance disagree")
+        if radius < 0 or stopping_distance < 0:
+            raise ValueError("radius and stopping_distance must be non-negative")
         self.ellipses = ellipses
         self.radius = float(radius)
-        self.corridor_margin = float(corridor_margin)
+        self.stopping_distance = float(stopping_distance)
+        self.corridor_margin = self.stopping_distance  # Backward-compatible result readers.
         self.iterations = int(iterations)
         self.device = ellipses.means.device
 
@@ -101,10 +137,10 @@ class PlanarCollisionSet:
                 dtype=segment.dtype,
                 device=segment.device,
             )
-            half_margin = self.radius + self.corridor_margin
+            half_margin = self.radius + self.stopping_distance
             b = A @ midpoint + half_margin
         else:
-            A, b, midpoint = compute_rotated_rectangle(segment, self.radius + self.corridor_margin)
+            A, b, midpoint = compute_rotated_rectangle(segment, self.radius + self.stopping_distance)
         keep = ellipse_halfspace_intersection(
             self.ellipses.means, self.ellipses.rots, self.ellipses.scales, A, b
         )

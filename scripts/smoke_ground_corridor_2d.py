@@ -24,7 +24,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(UPSTREAM))
 
 from ground_nav.bezier_2d import BezierPlanner2D  # noqa: E402
-from ground_nav.corridor_2d import PlanarCollisionSet, build_planar_corridor  # noqa: E402
+from ground_nav.corridor_2d import (  # noqa: E402
+    PlanarCollisionSet,
+    build_planar_corridor,
+    compute_stopping_distance,
+)
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from ground_nav.path_utils import simplify_ground_path  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
@@ -100,7 +104,14 @@ def main():
     parser.add_argument("--robot-height-meters", type=float, default=0.10)
     parser.add_argument("--footprint-radius-meters", type=float, default=0.15)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.02)
-    parser.add_argument("--corridor-margin-meters", type=float, default=0.10)
+    parser.add_argument("--max-speed-mps", type=float, default=0.20)
+    parser.add_argument("--max-brake-decel-mps2", type=float, default=0.30)
+    parser.add_argument(
+        "--corridor-margin-meters",
+        type=float,
+        default=None,
+        help="Deprecated manual override; default is vmax^2/(2*max_brake_decel)",
+    )
     parser.add_argument("--max-segment-meters", type=float, default=1.0)
     parser.add_argument("--start", nargs=2, type=float, required=True)
     parser.add_argument("--goal", nargs=2, type=float, required=True)
@@ -114,7 +125,18 @@ def main():
     height = args.robot_height_meters * scale
     radius = args.footprint_radius_meters * scale
     clearance = args.ground_clearance_meters * scale
-    margin = args.corridor_margin_meters * scale
+    computed_stopping_distance_m = compute_stopping_distance(
+        args.max_speed_mps, args.max_brake_decel_mps2
+    )
+    if args.corridor_margin_meters is None:
+        stopping_distance_m = computed_stopping_distance_m
+        stopping_distance_source = "vmax_squared_over_2_brake_decel"
+    else:
+        if args.corridor_margin_meters < 0.0:
+            raise ValueError("corridor-margin-meters must be non-negative")
+        stopping_distance_m = float(args.corridor_margin_meters)
+        stopping_distance_source = "manual_corridor_margin_override"
+    stopping_distance = stopping_distance_m * scale
     preset = SCENE_PRESETS[args.scene]
     lower = torch.tensor(preset["lower_bound"], device=device)
     upper = torch.tensor(preset["upper_bound"], device=device)
@@ -128,7 +150,9 @@ def main():
         voxel, args.z_floor_scene, height, radius, ground_clearance=clearance, project_occupied_endpoints=False
     ); sync(device); timings["height_projection_xy_dilation"] = time.time() - t0
     t0 = time.time(); ellipses = PlanarGaussianSet.from_gsplat(gsplat, grid.metadata.z_min, grid.metadata.z_max); sync(device); timings["ellipse_projection"] = time.time() - t0
-    collision_set = PlanarCollisionSet(ellipses, radius=radius, corridor_margin=margin, iterations=10)
+    collision_set = PlanarCollisionSet(
+        ellipses, radius=radius, stopping_distance=stopping_distance, iterations=10
+    )
 
     start, goal = np.asarray(args.start, np.float32), np.asarray(args.goal, np.float32)
     if grid.is_occupied(start) or grid.is_occupied(goal):
@@ -197,11 +221,20 @@ def main():
         "scene": args.scene, "device": str(device), "scale": scale,
         "physical": {
             "robot_height_m": args.robot_height_meters, "projected_circle_radius_m": args.footprint_radius_meters,
-            "ground_clearance_m": args.ground_clearance_meters, "corridor_margin_m": args.corridor_margin_meters,
+            "ground_clearance_m": args.ground_clearance_meters,
+            "max_speed_mps": args.max_speed_mps,
+            "max_brake_decel_mps2": args.max_brake_decel_mps2,
+            "computed_stopping_distance_m": computed_stopping_distance_m,
+            "stopping_distance_m": stopping_distance_m,
+            "stopping_distance_source": stopping_distance_source,
+            "corridor_margin_m": stopping_distance_m,
         },
         "scene_units": {
             "height": height, "circle_radius": radius, "ground_clearance": clearance,
-            "corridor_margin": margin, "z_floor_scene": args.z_floor_scene,
+            "stopping_distance": stopping_distance,
+            "collision_box_lateral_half_width": radius + stopping_distance,
+            "corridor_margin": stopping_distance,
+            "z_floor_scene": args.z_floor_scene,
             "z_min": grid.metadata.z_min, "z_max": grid.metadata.z_max,
         },
         "gaussians_total": int(gsplat.means.shape[0]), "projected_ellipses": len(ellipses),
