@@ -216,6 +216,67 @@ class GroundGridTest(unittest.TestCase):
             "center_distance_plus_cell_circumradius",
         )
 
+    def test_aabb_disk_rasterization_fills_covariance_support_box(self) -> None:
+        ellipses = ellipse_set()
+        grid = GroundGrid.from_projected_gaussians(
+            ellipses,
+            lower_xy=(-0.5, -0.5),
+            upper_xy=(0.5, 0.5),
+            resolution_xy=(10, 10),
+            footprint_radius=0.0,
+            rasterization="aabb_disk_dilation",
+        )
+        # sqrt(Sigma_xx)=0.20 and sqrt(Sigma_yy)=0.10 for this ellipse.
+        # With 0.1-wide cells on [-0.5, 0.5], including zero-area boundary
+        # contact gives x indices 2..7 and y indices 3..6.
+        expected = torch.zeros_like(grid.raw_occupied)
+        expected[2:8, 3:7] = True
+        torch.testing.assert_close(grid.raw_occupied, expected)
+        torch.testing.assert_close(grid.occupied, expected)
+        self.assertEqual(
+            grid.metadata.rasterization,
+            "ellipse_aabb_fill_xy_disk_dilation",
+        )
+
+    def test_aabb_disk_rasterization_is_more_conservative(self) -> None:
+        kwargs = dict(
+            ellipses=ellipse_set(),
+            lower_xy=(-1.0, -1.0),
+            upper_xy=(1.0, 1.0),
+            resolution_xy=(40, 40),
+            footprint_radius=0.15,
+        )
+        distance_grid = GroundGrid.from_projected_gaussians(
+            **kwargs, rasterization="ellipse_distance"
+        )
+        aabb_grid = GroundGrid.from_projected_gaussians(
+            **kwargs, rasterization="aabb_disk_dilation"
+        )
+        # The distance grid uses a cell circumcircle while the AABB grid uses
+        # cell-rectangle intersection, so their boundary cells need not be a
+        # strict pointwise subset. The AABB geometry should nevertheless
+        # occupy at least as many cells for this axis-aligned test ellipse.
+        self.assertGreaterEqual(
+            int(aabb_grid.raw_occupied.sum()),
+            int(distance_grid.raw_occupied.sum()),
+        )
+        self.assertGreaterEqual(
+            int(aabb_grid.occupied.sum()),
+            int(distance_grid.occupied.sum()),
+        )
+        self.assertIsNotNone(aabb_grid.dilation_kernel)
+
+    def test_unknown_projected_gaussian_rasterization_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            GroundGrid.from_projected_gaussians(
+                ellipse_set(),
+                (-1.0, -1.0),
+                (1.0, 1.0),
+                (40, 40),
+                0.15,
+                rasterization="unknown",
+            )
+
     def test_projected_gaussian_grid_is_scene_scale_invariant(self) -> None:
         base = GroundGrid.from_projected_gaussians(
             ellipse_set(scale=1.0), (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15

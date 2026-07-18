@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.colors import ListedColormap
 import numpy as np
 import scipy.optimize
 import scipy.spatial
@@ -104,6 +105,15 @@ def main():
     parser.add_argument("--robot-height-meters", type=float, default=0.10)
     parser.add_argument("--footprint-radius-meters", type=float, default=0.15)
     parser.add_argument("--ground-clearance-meters", type=float, default=0.02)
+    parser.add_argument(
+        "--grid-rasterization",
+        choices=("ellipse_distance", "aabb_disk_dilation"),
+        default="ellipse_distance",
+        help=(
+            "2D search-map construction: exact point-to-ellipse distance "
+            "(default) or conservative ellipse-AABB fill plus XY disk dilation"
+        ),
+    )
     parser.add_argument("--max-speed-mps", type=float, default=0.20)
     parser.add_argument("--max-brake-decel-mps2", type=float, default=0.30)
     parser.add_argument(
@@ -155,17 +165,28 @@ def main():
     t0 = time.time(); ellipses = PlanarGaussianSet.from_gsplat(
         gsplat, z_min, z_max, confidence=1.0
     ); sync(device); timings["height_filter_full_projection"] = time.time() - t0
-    t0 = time.time(); grid = GroundGrid.from_projected_gaussians(
-        ellipses,
-        lower_xy=lower[:2],
-        upper_xy=upper[:2],
-        resolution_xy=preset["resolution"],
-        footprint_radius=radius,
-        z_floor_scene=args.z_floor_scene,
-        robot_height=height,
-        ground_clearance=clearance,
-        project_occupied_endpoints=False,
-    ); sync(device); timings["projected_ellipse_rasterization"] = time.time() - t0
+    raster_grids = {}
+    rasterization_times = {}
+    for rasterization in ("ellipse_distance", "aabb_disk_dilation"):
+        t0 = time.time()
+        raster_grids[rasterization] = GroundGrid.from_projected_gaussians(
+            ellipses,
+            lower_xy=lower[:2],
+            upper_xy=upper[:2],
+            resolution_xy=preset["resolution"],
+            footprint_radius=radius,
+            z_floor_scene=args.z_floor_scene,
+            robot_height=height,
+            ground_clearance=clearance,
+            project_occupied_endpoints=False,
+            rasterization=rasterization,
+        )
+        sync(device)
+        rasterization_times[rasterization] = time.time() - t0
+        timings[f"rasterization_{rasterization}"] = rasterization_times[
+            rasterization
+        ]
+    grid = raster_grids[args.grid_rasterization]
     legacy_grid = None
     if args.legacy_voxel_diagnostic:
         t0 = time.time()
@@ -190,9 +211,56 @@ def main():
     )
 
     start, goal = np.asarray(args.start, np.float32), np.asarray(args.goal, np.float32)
-    if grid.is_occupied(start) or grid.is_occupied(goal):
-        raise RuntimeError("start or goal is occupied; automatic projection is disabled")
-    t0 = time.time(); raw_seed = grid.create_path(start, goal); timings["dijkstra_2d"] = time.time() - t0
+    raster_paths = {}
+    raster_comparison = {}
+    for rasterization, candidate_grid in raster_grids.items():
+        failure = None
+        path = np.empty((0, 2), dtype=np.float32)
+        dijkstra_time = 0.0
+        if candidate_grid.is_occupied(start):
+            failure = "start_occupied"
+        elif candidate_grid.is_occupied(goal):
+            failure = "goal_occupied"
+        else:
+            try:
+                t0 = time.time()
+                path = candidate_grid.create_path(start, goal)
+                dijkstra_time = time.time() - t0
+            except (RuntimeError, ValueError) as exc:
+                dijkstra_time = time.time() - t0
+                failure = str(exc)
+        raster_paths[rasterization] = path
+        length_m = (
+            float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum() / scale)
+            if len(path) > 1
+            else None
+        )
+        raster_comparison[rasterization] = {
+            "metadata_rasterization": candidate_grid.metadata.rasterization,
+            "rasterization_time_s": rasterization_times[rasterization],
+            "raw_occupied_cells": int(candidate_grid.raw_occupied.sum().item()),
+            "occupied_cells": int(candidate_grid.occupied.sum().item()),
+            "free_cells": int(candidate_grid.free.sum().item()),
+            "occupied_fraction": float(
+                candidate_grid.occupied.float().mean().item()
+            ),
+            "start_occupied": bool(candidate_grid.is_occupied(start)),
+            "goal_occupied": bool(candidate_grid.is_occupied(goal)),
+            "dijkstra_success": failure is None,
+            "dijkstra_failure": failure,
+            "dijkstra_time_s": dijkstra_time,
+            "path_points": int(len(path)),
+            "path_length_m": length_m,
+        }
+    raw_seed = raster_paths[args.grid_rasterization]
+    if len(raw_seed) == 0:
+        reason = raster_comparison[args.grid_rasterization]["dijkstra_failure"]
+        raise RuntimeError(
+            f"primary rasterization {args.grid_rasterization} cannot plan: {reason}"
+        )
+    timings["dijkstra_2d"] = raster_comparison[
+        args.grid_rasterization
+    ]["dijkstra_time_s"]
     t0 = time.time(); simplified = simplify_ground_path_supercover(
         raw_seed, grid, args.max_segment_meters * scale
     ); timings["simplification"] = time.time() - t0
@@ -218,6 +286,14 @@ def main():
         for A, b in corridor.polygons
     ]
     np.save(args.output_dir / "raw_seed.npy", raw_seed)
+    np.save(
+        args.output_dir / "ellipse_distance_seed.npy",
+        raster_paths["ellipse_distance"],
+    )
+    np.save(
+        args.output_dir / "aabb_disk_dilation_seed.npy",
+        raster_paths["aabb_disk_dilation"],
+    )
     np.save(args.output_dir / "simplified_seed.npy", simplified)
     np.save(args.output_dir / "control_points.npy", controls)
     np.save(args.output_dir / "trajectory.npy", dense)
@@ -277,6 +353,8 @@ def main():
         "map": {
             **grid.summary(),
             "projection_mode": ellipses.projection_mode,
+            "requested_rasterization": args.grid_rasterization,
+            "rasterization_comparison": raster_comparison,
             "legacy_voxel_diagnostic": bool(args.legacy_voxel_diagnostic),
         },
         "raw_seed_points": len(raw_seed), "simplified_seed_points": len(simplified),
@@ -293,6 +371,57 @@ def main():
     raw_occupancy = grid.raw_occupied.detach().cpu().numpy()
     occupancy = grid.occupied.detach().cpu().numpy()
     extent = [float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])]
+    distance_raw = raster_grids["ellipse_distance"].raw_occupied.detach().cpu().numpy()
+    distance_occupied = raster_grids["ellipse_distance"].occupied.detach().cpu().numpy()
+    aabb_raw = raster_grids["aabb_disk_dilation"].raw_occupied.detach().cpu().numpy()
+    aabb_occupied = raster_grids["aabb_disk_dilation"].occupied.detach().cpu().numpy()
+    raw_aabb_only = aabb_raw & ~distance_raw
+    raw_distance_only = distance_raw & ~aabb_raw
+    occupied_aabb_only = aabb_occupied & ~distance_occupied
+    occupied_distance_only = distance_occupied & ~aabb_occupied
+    raw_disagreement = np.zeros_like(distance_raw, dtype=np.uint8)
+    raw_disagreement[raw_distance_only] = 1
+    raw_disagreement[raw_aabb_only] = 2
+    occupied_disagreement = np.zeros_like(
+        distance_occupied, dtype=np.uint8
+    )
+    occupied_disagreement[occupied_distance_only] = 1
+    occupied_disagreement[occupied_aabb_only] = 2
+    raster_comparison["differences"] = {
+        "raw_aabb_only_cells": int(raw_aabb_only.sum()),
+        "raw_ellipse_distance_only_cells": int(raw_distance_only.sum()),
+        "occupied_aabb_only_cells": int(occupied_aabb_only.sum()),
+        "occupied_ellipse_distance_only_cells": int(
+            occupied_distance_only.sum()
+        ),
+    }
+    (args.output_dir / "grid_rasterization_comparison.json").write_text(
+        json.dumps(raster_comparison, indent=2)
+    )
+    np.savez_compressed(
+        args.output_dir / "grid_rasterization_comparison.npz",
+        ellipse_distance_raw=distance_raw,
+        ellipse_distance_occupied=distance_occupied,
+        aabb_disk_dilation_raw=aabb_raw,
+        aabb_disk_dilation_occupied=aabb_occupied,
+        raw_aabb_only=raw_aabb_only,
+        raw_ellipse_distance_only=raw_distance_only,
+        occupied_aabb_only=occupied_aabb_only,
+        occupied_ellipse_distance_only=occupied_distance_only,
+        raw_disagreement=raw_disagreement,
+        occupied_disagreement=occupied_disagreement,
+        ellipse_distance_seed=raster_paths["ellipse_distance"],
+        aabb_disk_dilation_seed=raster_paths["aabb_disk_dilation"],
+        extent=np.asarray(extent, dtype=np.float64),
+    )
+    result["map"]["rasterization_comparison"] = raster_comparison
+    (args.output_dir / "result.json").write_text(json.dumps(result, indent=2))
+    if args.grid_rasterization == "aabb_disk_dilation":
+        raw_map_title = "Projected-ellipse AABB rasterization"
+        search_map_title = "AABB grid with circular-footprint dilation"
+    else:
+        raw_map_title = "Conservative ellipse rasterization"
+        search_map_title = "Robot-footprint search grid"
 
     # Figure 1: one continuous source model and its two conservative grids.
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharex=True, sharey=True)
@@ -306,10 +435,98 @@ def main():
     axes[1].imshow(raw_occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
     axes[2].imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", aspect="equal")
     configure_map_axis(axes[0], extent, "Height-filtered projected ellipses")
-    configure_map_axis(axes[1], extent, "Conservative ellipse rasterization")
-    configure_map_axis(axes[2], extent, "Robot-footprint search grid")
+    configure_map_axis(axes[1], extent, raw_map_title)
+    configure_map_axis(axes[2], extent, search_map_title)
     fig.tight_layout()
     fig.savefig(args.output_dir / "planar_map_generation.png", dpi=180)
+    plt.close(fig)
+
+    # Direct comparison: same projected Gaussians, bounds, resolution, start,
+    # and goal; only the rasterization method changes.
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11), sharex=True, sharey=True)
+    disagreement_cmap = ListedColormap(
+        ["white", "tab:blue", "darkred"]
+    )
+    comparison_layers = (
+        (distance_raw, "Ellipse-distance raw grid", "Greys", None, None),
+        (aabb_raw, "Ellipse-AABB raw grid", "Greys", None, None),
+        (
+            raw_disagreement,
+            "Raw disagreement: blue=ellipse, red=AABB",
+            disagreement_cmap,
+            0,
+            2,
+        ),
+        (
+            distance_occupied,
+            "Ellipse-distance search grid",
+            "Greys",
+            None,
+            None,
+        ),
+        (aabb_occupied, "AABB + disk search grid", "Greys", None, None),
+        (
+            occupied_disagreement,
+            "Search disagreement: blue=ellipse, red=AABB",
+            disagreement_cmap,
+            0,
+            2,
+        ),
+    )
+    for axis, (layer, title, cmap, vmin, vmax) in zip(
+        axes.ravel(), comparison_layers
+    ):
+        axis.imshow(
+            layer.T,
+            origin="lower",
+            extent=extent,
+            cmap=cmap,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        configure_map_axis(axis, extent, title)
+    for axis, rasterization in (
+        (axes[1, 0], "ellipse_distance"),
+        (axes[1, 1], "aabb_disk_dilation"),
+    ):
+        path = raster_paths[rasterization]
+        if len(path) > 0:
+            axis.plot(
+                path[:, 0],
+                path[:, 1],
+                color="tab:blue",
+                linewidth=1.3,
+                label="2D Dijkstra",
+            )
+        axis.scatter(
+            start[0],
+            start[1],
+            marker="*",
+            s=80,
+            color="tab:green",
+            edgecolors="black",
+            linewidths=0.5,
+            label="start",
+            zorder=4,
+        )
+        axis.scatter(
+            goal[0],
+            goal[1],
+            marker="X",
+            s=60,
+            color="tab:purple",
+            edgecolors="black",
+            linewidths=0.5,
+            label="goal",
+            zorder=4,
+        )
+        axis.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(
+        args.output_dir / "grid_rasterization_comparison.png", dpi=180
+    )
     plt.close(fig)
 
     if legacy_grid is not None:

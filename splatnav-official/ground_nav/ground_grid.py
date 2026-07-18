@@ -146,19 +146,30 @@ class GroundGrid:
         robot_height: float | None = None,
         ground_clearance: float = 0.0,
         project_occupied_endpoints: bool = False,
+        rasterization: str = "ellipse_distance",
         distance_iterations: int = 40,
         max_pair_chunk: int = 1_000_000,
     ) -> "GroundGrid":
-        """Rasterize height-filtered projected ellipses conservatively.
+        """Rasterize height-filtered projected ellipses.
 
-        A cell is occupied when the Euclidean distance from its center to any
+        ``ellipse_distance`` is the authoritative, geometry-preserving mode:
+        a cell is occupied when the Euclidean distance from its center to any
         projected ellipse is no greater than the requested footprint radius
-        plus the cell circumradius. The circumradius makes this a conservative
-        rectangle-intersection test rather than a center-only approximation.
+        plus the cell circumradius.
+
+        ``aabb_disk_dilation`` is a deliberately more conservative baseline:
+        it fills every grid cell intersecting each ellipse's axis-aligned
+        bounding box, then dilates that binary map with a circular footprint
+        kernel. It is useful for diagnostics and ablation experiments.
         """
 
         if footprint_radius < 0:
             raise ValueError("footprint_radius must be non-negative")
+        if rasterization not in {"ellipse_distance", "aabb_disk_dilation"}:
+            raise ValueError(
+                "rasterization must be 'ellipse_distance' or "
+                "'aabb_disk_dilation'"
+            )
         if distance_iterations <= 0:
             raise ValueError("distance_iterations must be positive")
         if max_pair_chunk <= 0:
@@ -212,14 +223,25 @@ class GroundGrid:
         obj.lower_center = obj.xy_centers[0, 0]
         obj.shape = (int(resolution[0]), int(resolution[1]))
         cell_circumradius = 0.5 * float(torch.linalg.norm(obj.cell_sizes).item())
-        obj.raw_occupied, obj.occupied = obj._rasterize_projected_gaussians(
-            raw_threshold=cell_circumradius,
-            occupied_threshold=float(footprint_radius) + cell_circumradius,
-            distance_iterations=distance_iterations,
-            max_pair_chunk=max_pair_chunk,
-        )
+        if rasterization == "ellipse_distance":
+            obj.raw_occupied, obj.occupied = obj._rasterize_projected_gaussians(
+                raw_threshold=cell_circumradius,
+                occupied_threshold=float(footprint_radius) + cell_circumradius,
+                distance_iterations=distance_iterations,
+                max_pair_chunk=max_pair_chunk,
+            )
+            rasterization_label = "center_distance_plus_cell_circumradius"
+            obj.dilation_kernel = None
+        else:
+            obj.raw_occupied = obj._rasterize_projected_gaussian_aabbs()
+            obj.dilation_kernel = obj._make_occupied_cell_disk_kernel(
+                float(footprint_radius)
+            )
+            obj.occupied = obj._dilate(
+                obj.raw_occupied, obj.dilation_kernel
+            )
+            rasterization_label = "ellipse_aabb_fill_xy_disk_dilation"
         obj.free = ~obj.occupied
-        obj.dilation_kernel = None
         z_min = float(ellipses.z_min)
         z_max = float(ellipses.z_max)
         if z_floor_scene is None:
@@ -242,7 +264,7 @@ class GroundGrid:
             reference_z=0.5 * (z_min + z_max),
             z_indices=(),
             source="projected_gaussians",
-            rasterization="center_distance_plus_cell_circumradius",
+            rasterization=rasterization_label,
             confidence=float(ellipses.confidence),
             cell_circumradius=cell_circumradius,
         )
@@ -394,6 +416,61 @@ class GroundGrid:
         flush()
         return raw, occupied
 
+    def _rasterize_projected_gaussian_aabbs(self) -> torch.Tensor:
+        """Fill cells intersecting projected-ellipse axis-aligned boxes.
+
+        For a 1-sigma ellipse with covariance ``Sigma``, the exact support
+        half-extents of its world-axis-aligned box are
+        ``sqrt(Sigma_xx)`` and ``sqrt(Sigma_yy)``. The index bounds below use
+        cell rectangles, not only cell centers, so boundary-touching cells are
+        retained conservatively.
+        """
+
+        occupied = torch.zeros(
+            self.shape, dtype=torch.bool, device=self.device
+        )
+        if len(self.ellipses) == 0:
+            return occupied
+
+        means = self.ellipses.means.detach().cpu().numpy()
+        covs = self.ellipses.covs.detach().cpu().numpy()
+        half_extents = np.sqrt(
+            np.maximum(np.diagonal(covs, axis1=1, axis2=2), 0.0)
+        )
+        box_min = means - half_extents
+        box_max = means + half_extents
+        lower = (
+            self.lower_center - 0.5 * self.cell_sizes
+        ).detach().cpu().numpy()
+        cell = self.cell_sizes.detach().cpu().numpy()
+
+        # A cell [lower + i*cell, lower + (i+1)*cell] intersects a box
+        # interval [box_min, box_max] when both closed intervals overlap.
+        normalized_min = (box_min - lower[None]) / cell[None]
+        normalized_max = (box_max - lower[None]) / cell[None]
+        # Avoid losing a boundary-touching cell when an analytically integral
+        # coordinate is represented a few ulps above/below that integer.
+        index_tolerance = 1e-9
+        lo = np.ceil(normalized_min - index_tolerance).astype(
+            np.int64
+        ) - 1
+        hi = np.floor(normalized_max + index_tolerance).astype(
+            np.int64
+        )
+        lo = np.maximum(lo, 0)
+        hi = np.minimum(
+            hi, np.asarray(self.shape, dtype=np.int64)[None] - 1
+        )
+
+        for ellipse_id in range(len(self.ellipses)):
+            if np.any(lo[ellipse_id] > hi[ellipse_id]):
+                continue
+            occupied[
+                lo[ellipse_id, 0] : hi[ellipse_id, 0] + 1,
+                lo[ellipse_id, 1] : hi[ellipse_id, 1] + 1,
+            ] = True
+        return occupied
+
     def _make_disk_kernel(self, radius: float) -> torch.Tensor:
         """Build a conservative disk kernel for possibly non-square cells.
 
@@ -410,6 +487,34 @@ class GroundGrid:
         closest_x = torch.clamp(torch.abs(gx) * dx - dx / 2, min=0.0)
         closest_y = torch.clamp(torch.abs(gy) * dy - dy / 2, min=0.0)
         return closest_x.square() + closest_y.square() <= radius**2 + 1e-12
+
+    def _make_occupied_cell_disk_kernel(self, radius: float) -> torch.Tensor:
+        """Dilate the union of occupied cell rectangles by a metric disk.
+
+        Unlike ``_make_disk_kernel``, which treats each source cell as a point
+        at its center, this kernel uses the minimum distance between the source
+        and target cell rectangles. It is therefore the conservative discrete
+        counterpart of dilating an already rasterized AABB region.
+        """
+
+        if radius <= 0.0:
+            return torch.ones((1, 1), dtype=torch.bool, device=self.device)
+        dx, dy = (float(v) for v in self.cell_sizes.detach().cpu().tolist())
+        nx = int(np.ceil(radius / dx + 1.0))
+        ny = int(np.ceil(radius / dy + 1.0))
+        ix = torch.arange(
+            -nx, nx + 1, device=self.device, dtype=self.xy_centers.dtype
+        )
+        iy = torch.arange(
+            -ny, ny + 1, device=self.device, dtype=self.xy_centers.dtype
+        )
+        gx, gy = torch.meshgrid(ix, iy, indexing="ij")
+        separation_x = torch.clamp(torch.abs(gx) * dx - dx, min=0.0)
+        separation_y = torch.clamp(torch.abs(gy) * dy - dy, min=0.0)
+        return (
+            separation_x.square() + separation_y.square()
+            <= radius**2 + 1e-12
+        )
 
     @staticmethod
     def _dilate(occupied: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
