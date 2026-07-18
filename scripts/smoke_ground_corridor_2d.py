@@ -30,7 +30,7 @@ from ground_nav.corridor_2d import (  # noqa: E402
     compute_stopping_distance,
 )
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
-from ground_nav.path_utils import simplify_ground_path  # noqa: E402
+from ground_nav.path_utils import simplify_ground_path_supercover  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from initialization.grid_utils import GSplatVoxel  # noqa: E402
 from smoke_splatplan import SCENE_PRESETS  # noqa: E402
@@ -193,12 +193,9 @@ def main():
     if grid.is_occupied(start) or grid.is_occupied(goal):
         raise RuntimeError("start or goal is occupied; automatic projection is disabled")
     t0 = time.time(); raw_seed = grid.create_path(start, goal); timings["dijkstra_2d"] = time.time() - t0
-    t0 = time.time(); simplified = simplify_ground_path(raw_seed, grid, args.max_segment_meters * scale); timings["simplification"] = time.time() - t0
-    segments = np.stack([simplified[:-1], simplified[1:]], axis=1)
-    t0 = time.time(); exact_seed = [collision_set.segment_is_safe(segment) for segment in segments]; sync(device); timings["seed_exact_verification"] = time.time() - t0
-    if not all(exact_seed):
-        bad = [i for i, safe in enumerate(exact_seed) if not safe]
-        raise RuntimeError(f"inflated grid and projected ellipses disagree on simplified segments {bad}")
+    t0 = time.time(); simplified = simplify_ground_path_supercover(
+        raw_seed, grid, args.max_segment_meters * scale
+    ); timings["simplification"] = time.time() - t0
 
     t0 = time.time(); corridor = build_planar_corridor(simplified, collision_set); sync(device); timings["corridor"] = time.time() - t0
     planner = BezierPlanner2D(degree=6, continuity_order=3)
@@ -207,23 +204,13 @@ def main():
         raise RuntimeError(f"2D Bezier QP failed: {planner.last_solver_status}")
     dense = planner.sample(100)
 
-    dense_safe = True
-    for section in dense:
-        for p0, p1 in zip(section[:-1], section[1:]):
-            if not collision_set.segment_is_safe(np.stack([p0, p1])):
-                dense_safe = False
-                break
-        if not dense_safe:
-            break
     control_violation = max_control_violation(controls, corridor.polygons)
     endpoint_error = max(np.linalg.norm(dense[0, 0] - simplified[0]), np.linalg.norm(dense[-1, -1] - simplified[-1]))
     verification = {
         "path_is_strictly_2d": bool(raw_seed.shape[1] == simplified.shape[1] == dense.shape[2] == 2),
-        "simplified_seed_exact_safe": bool(all(exact_seed)),
         "qp_status": planner.last_solver_status,
         "max_control_point_violation": control_violation,
         "max_endpoint_error": float(endpoint_error),
-        "dense_trajectory_exact_safe": bool(dense_safe),
     }
 
     polygon_json = [
@@ -293,6 +280,11 @@ def main():
             "legacy_voxel_diagnostic": bool(args.legacy_voxel_diagnostic),
         },
         "raw_seed_points": len(raw_seed), "simplified_seed_points": len(simplified),
+        "path_simplification": {
+            "method": "integer_supercover",
+            "max_segment_m": args.max_segment_meters,
+            "standalone_exact_seed_verification": False,
+        },
         "polygon_count": len(corridor.polygons), "timings": timings,
         "qp_status": planner.last_solver_status, "failure_reason": None, "verification": verification,
     }
@@ -411,9 +403,9 @@ def main():
 
     print(json.dumps(result, indent=2))
     if not all([
-        verification["path_is_strictly_2d"], verification["simplified_seed_exact_safe"],
+        verification["path_is_strictly_2d"],
         verification["qp_status"] == "Solved", verification["max_control_point_violation"] <= 1e-5,
-        verification["max_endpoint_error"] <= 1e-6, verification["dense_trajectory_exact_safe"],
+        verification["max_endpoint_error"] <= 1e-6,
     ]):
         raise SystemExit("2D milestone verification failed")
 

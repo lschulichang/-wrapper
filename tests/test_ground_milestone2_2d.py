@@ -21,7 +21,7 @@ from ground_nav.corridor_2d import (  # noqa: E402
     compute_rotated_rectangle,
     continuous_circle_ellipse_test,
 )
-from ground_nav.path_utils import simplify_ground_path  # noqa: E402
+from ground_nav.path_utils import simplify_ground_path_supercover  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 
 
@@ -133,10 +133,10 @@ class Milestone2DTest(unittest.TestCase):
         self.assertFalse(collision_set.segment_is_safe(np.array([[0.0, 0.0], [0.0, 0.0]])))
         self.assertTrue(collision_set.segment_is_safe(np.array([[0.0, 1.0], [0.0, 1.0]])))
 
-    def test_simplification_uses_grid_line_of_sight_only(self):
+    def test_standard_simplification_uses_integer_supercover_only(self):
         grid = FakeGrid()
         path = np.array([[0.1, 0.1], [0.5, 0.1], [0.9, 0.1], [0.9, 1.7], [1.5, 1.7]])
-        simplified = simplify_ground_path(path, grid, 2.0)
+        simplified = simplify_ground_path_supercover(path, grid, 2.0)
         np.testing.assert_allclose(simplified[[0, -1]], path[[0, -1]])
         self.assertGreater(len(simplified), 2)
 
@@ -161,6 +161,37 @@ class Milestone2DTest(unittest.TestCase):
         np.testing.assert_allclose(controls[-1, :, -1], [0.8, 0.0], atol=1e-6)
         dense = planner.sample(50)
         self.assertEqual(dense.shape, (2, 50, 2))
+
+    def test_corridor_convex_hull_implies_dense_bezier_exact_safety(self):
+        ellipses = ellipse_set(
+            [[0.0, 0.35], [0.0, -0.35]],
+            [[0.1, 0.1], [0.1, 0.1]],
+        )
+        collision_set = PlanarCollisionSet(
+            ellipses, radius=0.05, corridor_margin=0.5
+        )
+        path = np.array(
+            [[-0.8, 0.0], [0.0, 0.0], [0.8, 0.0]], dtype=np.float32
+        )
+        corridor = build_planar_corridor(path, collision_set)
+        planner = BezierPlanner2D(degree=6, continuity_order=3)
+        controls, feasible = planner.optimize(
+            corridor.polygons, path[0], path[-1]
+        )
+        self.assertTrue(feasible)
+        for control_points, (A, b) in zip(controls, corridor.polygons):
+            self.assertTrue(
+                np.all(
+                    A.detach().cpu().numpy() @ control_points
+                    <= b.detach().cpu().numpy()[:, None] + 1e-6
+                )
+            )
+        dense = planner.sample(100)
+        for section in dense:
+            for first, second in zip(section[:-1], section[1:]):
+                self.assertTrue(
+                    collision_set.segment_is_safe(np.stack([first, second]))
+                )
 
 
 if __name__ == "__main__":

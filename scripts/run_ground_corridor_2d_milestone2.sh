@@ -34,7 +34,8 @@ cat > "$RUN_DIR/notes.md" <<EOF
 - Robot: 15 cm projected circle; no circumscribed sphere.
 - Search map: cells are conservatively occupied using exact point-to-ellipse distance plus the cell circumradius and robot footprint; the normal run does not build a 3D GS voxel grid.
 - Collision-set box: stopping distance is computed as vmax^2/(2*max_brake_decel) = 6.67 cm; the unshrunk half-width is robot radius + stopping distance.
-- Path simplification uses only the conservative inflated-grid line-of-sight condition; exact circle-ellipse collision is a separate consistency verification.
+- Path simplification uses integer supercover over the conservative robot-footprint grid. The standard run does not repeat an all-segment exact collision pass after simplification.
+- Corridor construction retains the paper-style continuous circle-ellipse K(s,t) computation needed to generate separating lines. Bezier safety follows from control-point containment and the convex-hull property; dense post-hoc trajectory collision checks remain in tests rather than the formal runtime.
 - Figures: planar_map_generation.png shows projected ellipses and both conservative grids; dijkstra_and_simplified_path.png shows both seed paths; projected_ellipses_corridor_bezier.png shows the continuous planar geometry and optimized trajectory.
 - Result: see assets/result.json and assets/verification.json.
 EOF

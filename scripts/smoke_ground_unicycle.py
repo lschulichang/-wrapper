@@ -377,9 +377,6 @@ def main():
         stopping_distance=stopping_distance,
         iterations=10,
     )
-    reference_exact_flags = continuous_safety_flags(
-        trajectory.data[:, 1:3], collision_set
-    )
     execution_exact_flags = continuous_safety_flags(
         executed[:, 1:3], collision_set
     )
@@ -420,7 +417,6 @@ def main():
         "max_lateral_error_m": float(np.max(np.abs(errors[:, 2]))),
         "final_position_error_m": float(errors[-1, 4]),
         "final_heading_error_rad": final_heading_error,
-        "reference_continuous_ellipse_safe": bool(np.all(reference_exact_flags)),
         "reference_inside_corridor": bool(np.all(reference_corridor_flags)),
         "continuous_ellipse_safe": bool(np.all(execution_exact_flags)),
         "inside_corridor": bool(np.all(execution_corridor_flags)),
@@ -429,16 +425,13 @@ def main():
             "execution": execution_corridor,
         },
         "segment_checks": {
-            "reference": {
-                "continuous_projected_ellipses": flag_statistics(reference_exact_flags),
-            },
             "execution": {
                 "continuous_projected_ellipses": flag_statistics(execution_exact_flags),
             },
         },
         "safety_model_roles": {
-            "safety_polygons": "hard constraint for the milestone-2 Bezier reference; execution diagnostic without a tracking tube",
-            "projected_ellipses": "authoritative continuous collision model for reference and execution",
+            "safety_polygons": "authoritative hard constraint for the milestone-2 Bezier reference; execution diagnostic without a tracking tube",
+            "projected_ellipses": "authoritative continuous collision model for the executed trajectory",
         },
         "reached_goal": bool(reached_goal),
         "limits": {
@@ -460,7 +453,6 @@ def main():
         "command_omega_within_limit": tracking_result["max_command_omega_radps"] <= args.max_omega_radps + tolerance,
         "command_accel_within_limit": tracking_result["max_command_accel_mps2"] <= args.max_accel_mps2 + 1e-5,
         "command_alpha_within_limit": tracking_result["max_command_alpha_radps2"] <= args.max_alpha_radps2 + 1e-5,
-        "reference_continuous_ellipse_safe": tracking_result["reference_continuous_ellipse_safe"],
         "reference_inside_corridor": tracking_result["reference_inside_corridor"],
         "execution_continuous_ellipse_safe": tracking_result["continuous_ellipse_safe"],
         "lateral_rmse_within_3cm": tracking_result["rmse_lateral_m"] <= 0.03,
