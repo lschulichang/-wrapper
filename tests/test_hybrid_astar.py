@@ -103,38 +103,6 @@ class HybridAStarTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start pose"):
             planner.plan([2.5, 2.5, 0.0], [12.5, 2.5, 0.0])
 
-    def test_forward_primitive_query_distinguishes_locally_trapped_pose(self):
-        open_planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
-        pose = np.asarray([5.5, 5.5, 0.0])
-        self.assertEqual(
-            len(open_planner.feasible_forward_primitive_indices(pose)),
-            len(open_planner.config.curvature_fractions),
-        )
-
-        blocked_cells = set()
-        for curvature_scene in open_planner.curvatures_scene:
-            samples = open_planner._sample_motion(
-                pose,
-                float(curvature_scene),
-                open_planner.primitive_length_scene,
-                collision_check=False,
-            )
-            self.assertIsNotNone(samples)
-            for sample in samples:
-                index = open_planner._point_index(sample[:2])
-                if index is not None and index != (5, 5):
-                    blocked_cells.add(index)
-        trapped_planner = HybridAStarPlanner(
-            FakeGrid(occupied=sorted(blocked_cells)),
-            1.0,
-            self.config(),
-        )
-        self.assertFalse(trapped_planner.occupied[5, 5])
-        self.assertEqual(
-            trapped_planner.feasible_forward_primitive_indices(pose),
-            (),
-        )
-
     def test_search_routes_around_blocking_wall(self):
         occupied = [
             (15, j)

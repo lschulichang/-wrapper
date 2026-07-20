@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired 30-case ablation of Hybrid A* seed compression."""
+"""Paired fixed-start ablation of Hybrid A* seed compression."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage
 import scipy.stats
 import torch
 
@@ -39,12 +40,7 @@ from ground_nav.hybrid_astar import (  # noqa: E402
 from ground_nav.path_utils import simplify_ground_path_supercover  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from ground_nav.timed_trajectory import evaluate_bezier_geometry  # noqa: E402
-from run_grid_rasterization_ablation import (  # noqa: E402
-    endpoint_indices,
-    generate_candidates,
-    path_length_m,
-    select_stratified,
-)
+from run_grid_rasterization_ablation import path_length_m  # noqa: E402
 from smoke_ground_corridor_2d import (  # noqa: E402
     configure_map_axis,
     max_control_violation,
@@ -153,13 +149,205 @@ def compress_direction_preserving(
     return result, diagnostics
 
 
-def endpoint_yaws(reference_path: np.ndarray) -> tuple[float, float]:
-    first = reference_path[1] - reference_path[0]
+def goal_yaw(reference_path: np.ndarray) -> float:
     last = reference_path[-1] - reference_path[-2]
-    return (
-        float(math.atan2(first[1], first[0])),
-        float(math.atan2(last[1], last[0])),
+    return float(math.atan2(last[1], last[0]))
+
+
+def path_turn_count(path: np.ndarray) -> int:
+    if len(path) < 3:
+        return 0
+    directions = np.sign(np.diff(path, axis=0)).astype(np.int8)
+    return int(
+        np.count_nonzero(
+            np.any(directions[1:] != directions[:-1], axis=1)
+        )
     )
+
+
+def generate_fixed_start_candidates(
+    grid: GroundGrid,
+    fixed_start: np.ndarray,
+    scale: float,
+    *,
+    count: int,
+    min_distance_m: float,
+    goal_clearance_m: float,
+    seed: int,
+) -> tuple[list[dict], dict, dict]:
+    """Generate random goals in the fixed start's free component."""
+
+    occupied = grid.occupied.detach().cpu().numpy().astype(bool)
+    free = ~occupied
+    structure = np.asarray(
+        [[0, 1, 0], [1, 1, 1], [0, 1, 0]],
+        dtype=np.uint8,
+    )
+    labels, component_count = scipy.ndimage.label(
+        free,
+        structure=structure,
+    )
+    start_index = tuple(
+        int(value)
+        for value in grid.world_to_grid(
+            fixed_start
+        ).detach().cpu().numpy()
+    )
+    if occupied[start_index]:
+        raise ValueError("the fixed start lies in an occupied cell")
+    start_component = int(labels[start_index])
+    if start_component == 0:
+        raise RuntimeError("the fixed start has no free component")
+    sampling_m = grid.cell_sizes.detach().cpu().numpy() / scale
+    clearance = scipy.ndimage.distance_transform_edt(
+        free,
+        sampling=sampling_m,
+    )
+    eligible = (
+        (labels == start_component)
+        & (clearance >= goal_clearance_m)
+    )
+    eligible[[0, -1], :] = False
+    eligible[:, [0, -1]] = False
+    eligible[start_index] = False
+    goal_indices = np.argwhere(eligible)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(goal_indices))
+    candidates = []
+    rejected_near = 0
+    rejected_path = 0
+    for rank in order:
+        goal_index = tuple(
+            int(value) for value in goal_indices[rank]
+        )
+        goal = grid.grid_to_world(
+            goal_index
+        ).detach().cpu().numpy()
+        direct_distance_m = float(
+            np.linalg.norm(goal - fixed_start) / scale
+        )
+        if direct_distance_m < min_distance_m:
+            rejected_near += 1
+            continue
+        try:
+            reference_path = grid.create_path(
+                fixed_start,
+                goal,
+            )
+        except (RuntimeError, ValueError):
+            rejected_path += 1
+            continue
+        candidates.append(
+            {
+                "candidate_id": f"candidate_{len(candidates):04d}",
+                "start_grid": list(start_index),
+                "goal_grid": list(goal_index),
+                "start_scene": fixed_start.tolist(),
+                "goal_scene": goal.tolist(),
+                "start_meters": (fixed_start / scale).tolist(),
+                "goal_meters": (goal / scale).tolist(),
+                "direct_distance_m": direct_distance_m,
+                "reference_path": reference_path,
+                "reference_path_length_m": path_length_m(
+                    reference_path,
+                    scale,
+                ),
+                "reference_path_points": int(len(reference_path)),
+                "reference_turn_count": path_turn_count(
+                    reference_path
+                ),
+            }
+        )
+        if len(candidates) == count:
+            break
+    if len(candidates) != count:
+        raise RuntimeError(
+            f"generated only {len(candidates)} of {count} fixed-start goals"
+        )
+    component_info = {
+        "component_count": int(component_count),
+        "fixed_start_component_label": start_component,
+        "fixed_start_component_cells": int(
+            np.count_nonzero(labels == start_component)
+        ),
+        "eligible_goal_cells": int(len(goal_indices)),
+        "goal_clearance_m": float(goal_clearance_m),
+    }
+    generation_info = {
+        "seed": int(seed),
+        "candidate_count": int(len(candidates)),
+        "minimum_goal_distance_m": float(min_distance_m),
+        "rejected_too_near": int(rejected_near),
+        "rejected_path_failure": int(rejected_path),
+    }
+    return candidates, component_info, generation_info
+
+
+def select_distance_turn_stratified(
+    candidates: list[dict],
+    sample_count: int,
+) -> list[dict]:
+    """Select equal-sized distance terciles across turn-count quantiles."""
+
+    if sample_count % 3:
+        raise ValueError("sample_count must be divisible by three")
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            row["direct_distance_m"],
+            row["reference_turn_count"],
+        ),
+    )
+    distance_layers = np.array_split(
+        np.asarray(ordered, dtype=object),
+        3,
+    )
+    per_layer = sample_count // 3
+    selected = []
+    for distance_layer, values in zip(
+        ("near", "medium", "far"),
+        distance_layers,
+    ):
+        rows = sorted(
+            values.tolist(),
+            key=lambda row: (
+                row["reference_turn_count"],
+                row["reference_path_length_m"],
+            ),
+        )
+        used = set()
+        for quantile in np.linspace(0.05, 0.95, per_layer):
+            desired = quantile * max(len(rows) - 1, 1)
+            ranks = sorted(
+                range(len(rows)),
+                key=lambda index: (
+                    abs(index - desired),
+                    index,
+                ),
+            )
+            chosen = None
+            for rank in ranks:
+                candidate = rows[rank]
+                if candidate["candidate_id"] in used:
+                    continue
+                chosen = dict(candidate)
+                chosen["distance_layer"] = distance_layer
+                chosen["turn_target_quantile"] = float(quantile)
+                used.add(candidate["candidate_id"])
+                selected.append(chosen)
+                break
+            if chosen is None:
+                raise RuntimeError(
+                    f"could not select {per_layer} goals for "
+                    f"distance layer {distance_layer}"
+                )
+    if len(selected) != sample_count:
+        raise RuntimeError(
+            f"selected only {len(selected)} of {sample_count} goals"
+        )
+    for index, row in enumerate(selected):
+        row["trial_id"] = f"trial_{index:03d}"
+    return selected
 
 
 def trajectory_quality(
@@ -218,7 +406,9 @@ def run_variant(
     record = {
         "trial_id": trial["trial_id"],
         "candidate_id": trial["candidate_id"],
-        "complexity_layer": trial["complexity_layer"],
+        "distance_layer": trial["distance_layer"],
+        "direct_distance_m": trial["direct_distance_m"],
+        "reference_turn_count": trial["reference_turn_count"],
         "variant": variant,
         "success": False,
         "failure_stage": None,
@@ -549,7 +739,7 @@ def plot_results(
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
     axes[0].bar(
         labels,
-        [len(successful[name]) / 30.0 for name in VARIANTS],
+        [len(successful[name]) / len(selected) for name in VARIANTS],
     )
     axes[0].set(ylim=(0, 1.05), title="End-to-end success rate")
     for axis, metric, title in (
@@ -596,14 +786,17 @@ def plot_results(
     plt.close(fig)
 
     representatives = []
-    for layer in ("low", "medium", "high"):
+    for layer in ("near", "medium", "far"):
         rows = sorted(
             [
                 row
                 for row in selected
-                if row["complexity_layer"] == layer
+                if row["distance_layer"] == layer
             ],
-            key=lambda row: row["reference_path_length_m"],
+            key=lambda row: (
+                row["reference_turn_count"],
+                row["reference_path_length_m"],
+            ),
         )
         representatives.append(rows[len(rows) // 2])
     occupied = grid.occupied.detach().cpu().numpy()
@@ -673,7 +866,7 @@ def plot_results(
             configure_map_axis(
                 axis,
                 extent,
-                f"{trial['complexity_layer']} / {variant}",
+                f"{trial['distance_layer']} / {variant}",
             )
     fig.tight_layout()
     fig.savefig(output_dir / "representative_paths.png", dpi=180)
@@ -699,13 +892,30 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, default=30)
     parser.add_argument("--dense-samples", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260718)
+    parser.add_argument(
+        "--fixed-start",
+        nargs=2,
+        type=float,
+        default=(0.7209999561, 0.2604999840),
+    )
+    parser.add_argument(
+        "--fixed-start-yaw-rad",
+        type=float,
+        default=math.pi,
+    )
     parser.add_argument("--min-turning-radius-meters", type=float, default=0.20)
     parser.add_argument("--hybrid-heading-bins", type=int, default=72)
     parser.add_argument("--hybrid-max-expansions", type=int, default=200000)
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
-    if args.sample_count != 30:
-        raise ValueError("the standard paired ablation requires 30 trials")
+    if args.sample_count <= 0 or args.sample_count % 3:
+        raise ValueError(
+            "sample_count must be a positive multiple of three"
+        )
+    if args.candidate_count < args.sample_count:
+        raise ValueError(
+            "candidate_count must be at least sample_count"
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -745,26 +955,23 @@ def main() -> None:
     sync(device)
     preprocessing["height_filter_projection_s"] = time.perf_counter() - begin
 
-    grids = {}
-    for rasterization in ("ellipse_distance", "aabb_disk_dilation"):
-        begin = time.perf_counter()
-        grids[rasterization] = GroundGrid.from_projected_gaussians(
-            ellipses,
-            lower_xy=lower[:2],
-            upper_xy=upper[:2],
-            resolution_xy=preset["resolution"],
-            footprint_radius=radius,
-            z_floor_scene=args.z_floor_scene,
-            robot_height=height,
-            ground_clearance=clearance,
-            project_occupied_endpoints=False,
-            rasterization=rasterization,
-        )
-        sync(device)
-        preprocessing[f"rasterization_{rasterization}_s"] = (
-            time.perf_counter() - begin
-        )
-    grid = grids["ellipse_distance"]
+    begin = time.perf_counter()
+    grid = GroundGrid.from_projected_gaussians(
+        ellipses,
+        lower_xy=lower[:2],
+        upper_xy=upper[:2],
+        resolution_xy=preset["resolution"],
+        footprint_radius=radius,
+        z_floor_scene=args.z_floor_scene,
+        robot_height=height,
+        ground_clearance=clearance,
+        project_occupied_endpoints=False,
+        rasterization="ellipse_distance",
+    )
+    sync(device)
+    preprocessing["rasterization_ellipse_distance_s"] = (
+        time.perf_counter() - begin
+    )
     collision_set = PlanarCollisionSet(
         ellipses,
         radius=radius,
@@ -772,20 +979,24 @@ def main() -> None:
         iterations=10,
     )
 
-    indices, endpoint_info = endpoint_indices(
-        grid,
-        grids["aabb_disk_dilation"],
-        scale,
-        args.endpoint_clearance_meters,
+    fixed_start = np.asarray(
+        args.fixed_start,
+        dtype=np.float64,
     )
+    fixed_start_yaw = float(args.fixed_start_yaw_rad)
+    if not np.isfinite(fixed_start_yaw):
+        raise ValueError("fixed-start-yaw-rad must be finite")
     begin = time.perf_counter()
-    candidates, candidate_info = generate_candidates(
-        grid,
-        indices,
-        scale,
-        args.candidate_count,
-        args.min_distance_meters,
-        args.seed,
+    candidates, endpoint_info, candidate_info = (
+        generate_fixed_start_candidates(
+            grid,
+            fixed_start,
+            scale,
+            count=args.candidate_count,
+            min_distance_m=args.min_distance_meters,
+            goal_clearance_m=args.endpoint_clearance_meters,
+            seed=args.seed,
+        )
     )
     preprocessing["candidate_generation_s"] = time.perf_counter() - begin
     hybrid_config = HybridAStarConfig(
@@ -798,60 +1009,24 @@ def main() -> None:
         scene_scale=scale,
         config=hybrid_config,
     )
-    eligible_candidates = []
-    excluded_start_poses = []
     for candidate in candidates:
-        start_yaw, goal_yaw = endpoint_yaws(candidate["reference_path"])
-        candidate["start_yaw_rad"] = start_yaw
-        candidate["goal_yaw_rad"] = goal_yaw
-        feasible_indices = hybrid.feasible_forward_primitive_indices(
-            [*candidate["start_scene"], start_yaw]
+        candidate["start_yaw_rad"] = fixed_start_yaw
+        candidate["goal_yaw_rad"] = goal_yaw(
+            candidate["reference_path"]
         )
-        candidate["feasible_start_primitive_indices"] = list(
-            feasible_indices
-        )
-        candidate["feasible_start_primitive_count"] = int(
-            len(feasible_indices)
-        )
-        candidate["feasible_start_curvature_fractions"] = [
-            float(hybrid.config.curvature_fractions[index])
-            for index in feasible_indices
-        ]
-        if feasible_indices:
-            eligible_candidates.append(candidate)
-            continue
-        excluded_start_poses.append(
-            {
-                **{
-                    key: value
-                    for key, value in candidate.items()
-                    if key != "reference_path"
-                },
-                "exclusion_reason": (
-                    "collision-free start pose has no feasible forward "
-                    "motion primitive"
-                ),
-            }
-        )
-    if len(eligible_candidates) < args.sample_count:
-        raise RuntimeError(
-            f"only {len(eligible_candidates)} candidates remain after "
-            "the forward-primitive feasibility filter"
-        )
-    selected = select_stratified(
-        eligible_candidates,
+    selected = select_distance_turn_stratified(
+        candidates,
         args.sample_count,
     )
-    if any(
-        trial["feasible_start_primitive_count"] == 0
-        for trial in selected
-    ):
-        raise RuntimeError(
-            "formal sample contains a zero-forward-primitive start pose"
-        )
     save_json(
-        args.output_dir / "excluded_start_poses.json",
-        excluded_start_poses,
+        args.output_dir / "fixed_start.json",
+        {
+            "scene": fixed_start.tolist(),
+            "meters": (fixed_start / scale).tolist(),
+            "yaw_rad": fixed_start_yaw,
+            "yaw_deg": float(np.degrees(fixed_start_yaw)),
+            "source": "previously verified old_union fixed run",
+        },
     )
     save_json(
         args.output_dir / "selected_pairs.json",
@@ -868,14 +1043,17 @@ def main() -> None:
         ],
     )
     representative_ids = set()
-    for layer in ("low", "medium", "high"):
+    for layer in ("near", "medium", "far"):
         rows = sorted(
             [
                 row
                 for row in selected
-                if row["complexity_layer"] == layer
+                if row["distance_layer"] == layer
             ],
-            key=lambda row: row["reference_path_length_m"],
+            key=lambda row: (
+                row["reference_turn_count"],
+                row["reference_path_length_m"],
+            ),
         )
         representative_ids.add(rows[len(rows) // 2]["trial_id"])
 
@@ -886,21 +1064,18 @@ def main() -> None:
     search_path = args.output_dir / "search_records.jsonl"
     for trial_index, trial in enumerate(selected):
         print(
-            f"[{trial_index + 1:02d}/30] {trial['trial_id']} Hybrid A*",
+            f"[{trial_index + 1:03d}/{args.sample_count:03d}] "
+            f"{trial['trial_id']} Hybrid A*",
             flush=True,
         )
         search_record = {
             "trial_id": trial["trial_id"],
             "candidate_id": trial["candidate_id"],
-            "complexity_layer": trial["complexity_layer"],
+            "distance_layer": trial["distance_layer"],
+            "direct_distance_m": trial["direct_distance_m"],
+            "reference_turn_count": trial["reference_turn_count"],
             "start_yaw_rad": trial["start_yaw_rad"],
             "goal_yaw_rad": trial["goal_yaw_rad"],
-            "feasible_start_primitive_count": trial[
-                "feasible_start_primitive_count"
-            ],
-            "feasible_start_primitive_indices": trial[
-                "feasible_start_primitive_indices"
-            ],
             "success": False,
             "failure_reason": None,
         }
@@ -998,16 +1173,11 @@ def main() -> None:
             "preprocessing": preprocessing,
             "endpoint_selection": endpoint_info,
             "candidate_generation": candidate_info,
-            "start_pose_prefilter": {
-                "definition": (
-                    "exclude a collision-free start pose when every configured "
-                    "forward Hybrid A* motion primitive collides"
-                ),
-                "generated_candidate_count": int(len(candidates)),
-                "eligible_candidate_count": int(len(eligible_candidates)),
-                "excluded_candidate_count": int(
-                    len(excluded_start_poses)
-                ),
+            "fixed_start_protocol": {
+                "start_scene": fixed_start.tolist(),
+                "start_meters": (fixed_start / scale).tolist(),
+                "start_yaw_rad": fixed_start_yaw,
+                "start_yaw_deg": float(np.degrees(fixed_start_yaw)),
                 "formal_selected_count": int(len(selected)),
             },
             "physical_parameters": {
@@ -1024,14 +1194,22 @@ def main() -> None:
                 "seed": args.seed,
                 "candidate_count": args.candidate_count,
                 "sample_count": args.sample_count,
-                "strata": ["low", "medium", "high"],
+                "distance_strata": ["near", "medium", "far"],
+                "trials_per_distance_stratum": int(
+                    args.sample_count // 3
+                ),
+                "within_stratum_selection": (
+                    f"{args.sample_count // 3} turn-count quantiles "
+                    "from 0.05 to 0.95 per distance stratum"
+                ),
                 "endpoint_yaw_source": (
-                    "first and last segment directions of the deterministic "
-                    "ellipse-distance Dijkstra reference path"
+                    "fixed verified start yaw; goal yaw from the last segment "
+                    "of the deterministic ellipse-distance Dijkstra "
+                    "reference path"
                 ),
                 "continuous_posthoc_collision_review": False,
                 "main_pipeline_modified": False,
-                "zero_forward_primitive_starts_in_formal_sample": False,
+                "zero_forward_primitive_prefilter_enabled": False,
                 "direction_preservation_note": (
                     "Compression is independently applied inside each "
                     "forward/reverse run. The current Hybrid A* planner is "

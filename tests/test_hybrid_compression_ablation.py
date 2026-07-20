@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from run_hybrid_compression_ablation import (  # noqa: E402
     compress_direction_preserving,
     motion_direction_runs,
+    select_distance_turn_stratified,
 )
 
 
@@ -87,6 +88,70 @@ class HybridCompressionAblationTest(unittest.TestCase):
                 poses,
                 grid,
                 max_segment_scene=10.0,
+            )
+
+    def test_fixed_start_selection_balances_distance_and_turns(self):
+        candidates = []
+        for index in range(90):
+            candidates.append(
+                {
+                    "candidate_id": f"candidate_{index:04d}",
+                    "direct_distance_m": float(index + 1),
+                    "reference_turn_count": int(index % 10),
+                    "reference_path_length_m": float(index + 2),
+                }
+            )
+        selected = select_distance_turn_stratified(
+            candidates,
+            sample_count=30,
+        )
+        self.assertEqual(len(selected), 30)
+        self.assertEqual(
+            len({row["candidate_id"] for row in selected}),
+            30,
+        )
+        for layer in ("near", "medium", "far"):
+            rows = [
+                row
+                for row in selected
+                if row["distance_layer"] == layer
+            ]
+            self.assertEqual(len(rows), 10)
+            self.assertGreaterEqual(
+                len({row["reference_turn_count"] for row in rows}),
+                8,
+            )
+
+    def test_fixed_start_selection_scales_to_120_trials(self):
+        candidates = []
+        for index in range(1200):
+            candidates.append(
+                {
+                    "candidate_id": f"candidate_{index:04d}",
+                    "direct_distance_m": float(index + 1),
+                    "reference_turn_count": int(index % 100),
+                    "reference_path_length_m": float(index + 2),
+                }
+            )
+        selected = select_distance_turn_stratified(
+            candidates,
+            sample_count=120,
+        )
+        self.assertEqual(len(selected), 120)
+        self.assertEqual(
+            len({row["candidate_id"] for row in selected}),
+            120,
+        )
+        for layer in ("near", "medium", "far"):
+            rows = [
+                row
+                for row in selected
+                if row["distance_layer"] == layer
+            ]
+            self.assertEqual(len(rows), 40)
+            self.assertEqual(
+                len({row["turn_target_quantile"] for row in rows}),
+                40,
             )
 
 
