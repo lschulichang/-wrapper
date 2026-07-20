@@ -31,6 +31,7 @@ from ground_nav.corridor_2d import (  # noqa: E402
     compute_stopping_distance,
 )
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
+from ground_nav.hybrid_astar import HybridAStarConfig, HybridAStarPlanner  # noqa: E402
 from ground_nav.path_utils import simplify_ground_path_supercover  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 from initialization.grid_utils import GSplatVoxel  # noqa: E402
@@ -114,6 +115,32 @@ def main():
             "(default) or conservative ellipse-AABB fill plus XY disk dilation"
         ),
     )
+    parser.add_argument(
+        "--planner",
+        choices=("dijkstra", "hybrid_astar"),
+        default="dijkstra",
+        help="Coarse path backend; Hybrid A* is forward-only in this milestone",
+    )
+    parser.add_argument(
+        "--start-yaw-rad",
+        type=float,
+        default=None,
+        help="Required start heading when --planner=hybrid_astar",
+    )
+    parser.add_argument(
+        "--goal-yaw-rad",
+        type=float,
+        default=None,
+        help="Required goal heading when --planner=hybrid_astar",
+    )
+    parser.add_argument(
+        "--min-turning-radius-meters",
+        type=float,
+        default=0.20,
+        help="Hybrid A* minimum turning radius in physical meters",
+    )
+    parser.add_argument("--hybrid-heading-bins", type=int, default=72)
+    parser.add_argument("--hybrid-max-expansions", type=int, default=200000)
     parser.add_argument("--max-speed-mps", type=float, default=0.20)
     parser.add_argument("--max-brake-decel-mps2", type=float, default=0.30)
     parser.add_argument(
@@ -132,6 +159,14 @@ def main():
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
+    if args.planner == "hybrid_astar":
+        if args.start_yaw_rad is None or args.goal_yaw_rad is None:
+            parser.error(
+                "--start-yaw-rad and --goal-yaw-rad are required "
+                "when --planner=hybrid_astar"
+            )
+        if not np.isfinite(args.start_yaw_rad) or not np.isfinite(args.goal_yaw_rad):
+            parser.error("Hybrid A* headings must be finite")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -252,22 +287,97 @@ def main():
             "path_points": int(len(path)),
             "path_length_m": length_m,
         }
-    raw_seed = raster_paths[args.grid_rasterization]
-    if len(raw_seed) == 0:
-        reason = raster_comparison[args.grid_rasterization]["dijkstra_failure"]
-        raise RuntimeError(
-            f"primary rasterization {args.grid_rasterization} cannot plan: {reason}"
+    hybrid_result = None
+    if args.planner == "dijkstra":
+        raw_seed = raster_paths[args.grid_rasterization]
+        if len(raw_seed) == 0:
+            reason = raster_comparison[args.grid_rasterization]["dijkstra_failure"]
+            raise RuntimeError(
+                f"primary rasterization {args.grid_rasterization} cannot plan: {reason}"
+            )
+        timings["dijkstra_2d"] = raster_comparison[
+            args.grid_rasterization
+        ]["dijkstra_time_s"]
+        t0 = time.time()
+        simplified = simplify_ground_path_supercover(
+            raw_seed, grid, args.max_segment_meters * scale
         )
-    timings["dijkstra_2d"] = raster_comparison[
-        args.grid_rasterization
-    ]["dijkstra_time_s"]
-    t0 = time.time(); simplified = simplify_ground_path_supercover(
-        raw_seed, grid, args.max_segment_meters * scale
-    ); timings["simplification"] = time.time() - t0
+        timings["simplification"] = time.time() - t0
+        search_summary = {
+            "backend": "native_2d_dijkstra_4_connected",
+            "path_points": int(len(raw_seed)),
+            "path_length_m": float(
+                np.linalg.norm(np.diff(raw_seed, axis=0), axis=1).sum() / scale
+            ),
+        }
+        simplification_summary = {
+            "method": "integer_supercover",
+            "max_segment_m": args.max_segment_meters,
+            "standalone_exact_seed_verification": False,
+        }
+        raw_seed_label = "2D Dijkstra"
+        corridor_seed_label = "LOS simplified"
+    else:
+        hybrid_config = HybridAStarConfig(
+            heading_bins=args.hybrid_heading_bins,
+            min_turning_radius_m=args.min_turning_radius_meters,
+            max_expansions=args.hybrid_max_expansions,
+        )
+        planner_hybrid = HybridAStarPlanner(
+            grid,
+            scene_scale=scale,
+            config=hybrid_config,
+        )
+        t0 = time.time()
+        hybrid_result = planner_hybrid.plan(
+            [start[0], start[1], args.start_yaw_rad],
+            [goal[0], goal[1], args.goal_yaw_rad],
+        )
+        timings["hybrid_astar"] = time.time() - t0
+        raw_seed = hybrid_result.xy
+        # Hybrid A* already samples every primitive densely. Do not perform
+        # line-of-sight compression; only remove exact adjacent duplicates.
+        t0 = time.time()
+        keep = np.concatenate([
+            [True],
+            np.linalg.norm(np.diff(raw_seed, axis=0), axis=1) > 1e-12,
+        ])
+        simplified = raw_seed[keep]
+        timings["duplicate_cleanup"] = time.time() - t0
+        if len(simplified) < 2:
+            raise RuntimeError("Hybrid A* returned fewer than two distinct XY points")
+        search_summary = hybrid_result.summary()
+        search_summary.update({
+            "start_pose_scene": [
+                float(start[0]), float(start[1]), float(args.start_yaw_rad)
+            ],
+            "goal_pose_scene": [
+                float(goal[0]), float(goal[1]), float(args.goal_yaw_rad)
+            ],
+        })
+        simplification_summary = {
+            "method": "none_adjacent_duplicate_cleanup_only",
+            "standalone_exact_seed_verification": False,
+        }
+        raw_seed_label = "Hybrid A* dense seed"
+        corridor_seed_label = "Hybrid A* corridor seed"
 
     t0 = time.time(); corridor = build_planar_corridor(simplified, collision_set); sync(device); timings["corridor"] = time.time() - t0
     planner = BezierPlanner2D(degree=6, continuity_order=3)
-    t0 = time.time(); controls, feasible = planner.optimize(corridor.polygons, simplified[0], simplified[-1]); timings["bezier_qp"] = time.time() - t0
+    t0 = time.time()
+    controls, feasible = planner.optimize(
+        corridor.polygons,
+        simplified[0],
+        simplified[-1],
+        start_yaw=args.start_yaw_rad if args.planner == "hybrid_astar" else None,
+        goal_yaw=args.goal_yaw_rad if args.planner == "hybrid_astar" else None,
+        endpoint_tangent_min=(
+            0.25 * float(torch.min(grid.cell_sizes).item())
+            if args.planner == "hybrid_astar"
+            else 0.0
+        ),
+    )
+    timings["bezier_qp"] = time.time() - t0
     if not feasible:
         raise RuntimeError(f"2D Bezier QP failed: {planner.last_solver_status}")
     dense = planner.sample(100)
@@ -297,6 +407,16 @@ def main():
     np.save(args.output_dir / "simplified_seed.npy", simplified)
     np.save(args.output_dir / "control_points.npy", controls)
     np.save(args.output_dir / "trajectory.npy", dense)
+    if hybrid_result is not None:
+        np.save(args.output_dir / "hybrid_seed.npy", hybrid_result.poses_scene)
+        np.savez_compressed(
+            args.output_dir / "hybrid_primitives.npz",
+            node_poses_scene=hybrid_result.node_poses_scene,
+            primitive_curvatures_1pm=hybrid_result.primitive_curvatures_1pm,
+        )
+        (args.output_dir / "hybrid_search.json").write_text(
+            json.dumps(search_summary, indent=2)
+        )
     np.savez_compressed(
         args.output_dir / "projected_gaussians.npz",
         ids=ellipses.ids.detach().cpu().numpy(),
@@ -331,6 +451,7 @@ def main():
     (args.output_dir / "verification.json").write_text(json.dumps(verification, indent=2))
     result = {
         "scene": args.scene, "device": str(device), "scale": scale,
+        "planner": args.planner, "search": search_summary,
         "physical": {
             "robot_height_m": args.robot_height_meters, "projected_circle_radius_m": args.footprint_radius_meters,
             "ground_clearance_m": args.ground_clearance_meters,
@@ -352,17 +473,14 @@ def main():
         "gaussians_total": int(gsplat.means.shape[0]), "projected_ellipses": len(ellipses),
         "map": {
             **grid.summary(),
+            "search_backend": search_summary["backend"],
             "projection_mode": ellipses.projection_mode,
             "requested_rasterization": args.grid_rasterization,
             "rasterization_comparison": raster_comparison,
             "legacy_voxel_diagnostic": bool(args.legacy_voxel_diagnostic),
         },
         "raw_seed_points": len(raw_seed), "simplified_seed_points": len(simplified),
-        "path_simplification": {
-            "method": "integer_supercover",
-            "max_segment_m": args.max_segment_meters,
-            "standalone_exact_seed_verification": False,
-        },
+        "path_simplification": simplification_summary,
         "polygon_count": len(corridor.polygons), "timings": timings,
         "qp_status": planner.last_solver_status, "failure_reason": None, "verification": verification,
     }
@@ -569,18 +687,26 @@ def main():
         fig.savefig(args.output_dir / "legacy_map_comparison.png", dpi=180)
         plt.close(fig)
 
-    # Figure 2: the direct 2D Dijkstra path and its deterministic LOS simplification.
+    # Figure 2: the selected search result and the exact seed passed to the corridor.
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.imshow(occupancy.T, origin="lower", extent=extent, cmap="Greys", alpha=0.72, aspect="equal")
-    ax.plot(raw_seed[:, 0], raw_seed[:, 1], color="tab:blue", linewidth=1.5, label="2D Dijkstra")
+    ax.plot(
+        raw_seed[:, 0], raw_seed[:, 1], color="tab:blue", linewidth=1.5,
+        label=raw_seed_label,
+    )
     ax.plot(
         simplified[:, 0], simplified[:, 1], "o--", color="tab:orange", linewidth=1.8,
-        markersize=4.5, label="LOS simplified",
+        markersize=4.5, label=corridor_seed_label,
     )
     configure_map_axis(ax, extent, "Projected-Gaussian search grid and 2D seed paths")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(args.output_dir / "dijkstra_and_simplified_path.png", dpi=180)
+    seed_figure_name = (
+        "dijkstra_and_simplified_path.png"
+        if args.planner == "dijkstra"
+        else "hybrid_astar_and_corridor_seed.png"
+    )
+    fig.savefig(args.output_dir / seed_figure_name, dpi=180)
     plt.close(fig)
 
     # Figure 3: continuous projected-Gaussian geometry, convex corridor, and Bezier result.
@@ -606,7 +732,7 @@ def main():
             polygon_label = False
     ax.plot(
         simplified[:, 0], simplified[:, 1], "o--", color="tab:blue", linewidth=1.6,
-        markersize=4.5, label="simplified seed", zorder=3,
+        markersize=4.5, label=corridor_seed_label, zorder=3,
     )
     ax.plot(
         dense[:, :, 0].ravel(), dense[:, :, 1].ravel(), color="tab:orange",

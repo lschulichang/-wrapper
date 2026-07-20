@@ -31,10 +31,25 @@ class BezierPlanner2D:
         count = self.degree + 1
         return section * 2 * count + dimension * count + control
 
-    def optimize(self, polygons, start, goal):
+    def optimize(
+        self,
+        polygons,
+        start,
+        goal,
+        *,
+        start_yaw: float | None = None,
+        goal_yaw: float | None = None,
+        endpoint_tangent_min: float = 0.0,
+    ):
         sections = len(polygons)
         if sections == 0:
             raise ValueError("at least one polygon is required")
+        if start_yaw is not None and not np.isfinite(start_yaw):
+            raise ValueError("start_yaw must be finite")
+        if goal_yaw is not None and not np.isfinite(goal_yaw):
+            raise ValueError("goal_yaw must be finite")
+        if not np.isfinite(endpoint_tangent_min) or endpoint_tangent_min < 0.0:
+            raise ValueError("endpoint_tangent_min must be finite and non-negative")
         count = self.degree + 1
         variables = sections * 2 * count
         difference = np.eye(count - 1, count, k=1) - np.eye(count - 1, count)
@@ -59,6 +74,33 @@ class BezierPlanner2D:
             C_rows.append(row); d.append(float(start[dimension]))
             row = np.zeros(variables); row[self._index(sections - 1, dimension, self.degree)] = 1.0
             C_rows.append(row); d.append(float(goal[dimension]))
+        for section, previous_control, next_control, yaw in (
+            (0, 0, 1, start_yaw),
+            (sections - 1, self.degree - 1, self.degree, goal_yaw),
+        ):
+            if yaw is None:
+                continue
+            direction = np.array([np.cos(yaw), np.sin(yaw)])
+            perpendicular = np.array([-direction[1], direction[0]])
+            tangent_row = np.zeros(variables)
+            forward_row = np.zeros(variables)
+            for dimension in range(2):
+                tangent_row[self._index(section, dimension, next_control)] = (
+                    perpendicular[dimension]
+                )
+                tangent_row[self._index(section, dimension, previous_control)] = (
+                    -perpendicular[dimension]
+                )
+                # Clarabel's nonnegative cone encodes Gx <= h. This row
+                # requires the endpoint derivative to point forward along yaw.
+                forward_row[self._index(section, dimension, next_control)] = (
+                    -direction[dimension]
+                )
+                forward_row[self._index(section, dimension, previous_control)] = (
+                    direction[dimension]
+                )
+            C_rows.append(tangent_row); d.append(0.0)
+            G_rows.append(forward_row); h.append(-float(endpoint_tangent_min))
         for section in range(sections - 1):
             for order in range(self.continuity_order + 1):
                 left_indices, left_coeffs = _derivative_endpoint(self.degree, order, True)
