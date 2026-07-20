@@ -207,6 +207,33 @@ class HybridAStarPlanner:
         index = self._point_index(state[:2])
         return index is not None and not bool(self.occupied[index])
 
+    def feasible_forward_primitive_indices(
+        self,
+        pose: Pose2D | Sequence[float],
+    ) -> tuple[int, ...]:
+        """Return motion-primitive indices that can leave ``pose`` safely.
+
+        This is a local feasibility query, not a reachability guarantee.  It
+        distinguishes a collision-free pose with no admissible forward
+        departure from a pose that is suitable for evaluating the forward-only
+        Hybrid A* search.
+        """
+
+        state = Pose2D.from_value(pose).as_array()
+        if not self._state_is_free(state):
+            return ()
+        feasible = []
+        for index, curvature_scene in enumerate(self.curvatures_scene):
+            samples = self._sample_motion(
+                state,
+                float(curvature_scene),
+                self.primitive_length_scene,
+                collision_check=True,
+            )
+            if samples is not None:
+                feasible.append(index)
+        return tuple(feasible)
+
     @staticmethod
     def _integrate(
         state: np.ndarray, curvature_scene: float, distance_scene: float

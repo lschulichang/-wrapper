@@ -788,12 +788,71 @@ def main() -> None:
         args.seed,
     )
     preprocessing["candidate_generation_s"] = time.perf_counter() - begin
-    selected = select_stratified(candidates, args.sample_count)
-    for trial in selected:
-        start_yaw, goal_yaw = endpoint_yaws(trial["reference_path"])
-        trial["start_yaw_rad"] = start_yaw
-        trial["goal_yaw_rad"] = goal_yaw
-
+    hybrid_config = HybridAStarConfig(
+        heading_bins=args.hybrid_heading_bins,
+        min_turning_radius_m=args.min_turning_radius_meters,
+        max_expansions=args.hybrid_max_expansions,
+    )
+    hybrid = HybridAStarPlanner(
+        grid,
+        scene_scale=scale,
+        config=hybrid_config,
+    )
+    eligible_candidates = []
+    excluded_start_poses = []
+    for candidate in candidates:
+        start_yaw, goal_yaw = endpoint_yaws(candidate["reference_path"])
+        candidate["start_yaw_rad"] = start_yaw
+        candidate["goal_yaw_rad"] = goal_yaw
+        feasible_indices = hybrid.feasible_forward_primitive_indices(
+            [*candidate["start_scene"], start_yaw]
+        )
+        candidate["feasible_start_primitive_indices"] = list(
+            feasible_indices
+        )
+        candidate["feasible_start_primitive_count"] = int(
+            len(feasible_indices)
+        )
+        candidate["feasible_start_curvature_fractions"] = [
+            float(hybrid.config.curvature_fractions[index])
+            for index in feasible_indices
+        ]
+        if feasible_indices:
+            eligible_candidates.append(candidate)
+            continue
+        excluded_start_poses.append(
+            {
+                **{
+                    key: value
+                    for key, value in candidate.items()
+                    if key != "reference_path"
+                },
+                "exclusion_reason": (
+                    "collision-free start pose has no feasible forward "
+                    "motion primitive"
+                ),
+            }
+        )
+    if len(eligible_candidates) < args.sample_count:
+        raise RuntimeError(
+            f"only {len(eligible_candidates)} candidates remain after "
+            "the forward-primitive feasibility filter"
+        )
+    selected = select_stratified(
+        eligible_candidates,
+        args.sample_count,
+    )
+    if any(
+        trial["feasible_start_primitive_count"] == 0
+        for trial in selected
+    ):
+        raise RuntimeError(
+            "formal sample contains a zero-forward-primitive start pose"
+        )
+    save_json(
+        args.output_dir / "excluded_start_poses.json",
+        excluded_start_poses,
+    )
     save_json(
         args.output_dir / "selected_pairs.json",
         [
@@ -807,17 +866,6 @@ def main() -> None:
             }
             for trial in selected
         ],
-    )
-
-    hybrid_config = HybridAStarConfig(
-        heading_bins=args.hybrid_heading_bins,
-        min_turning_radius_m=args.min_turning_radius_meters,
-        max_expansions=args.hybrid_max_expansions,
-    )
-    hybrid = HybridAStarPlanner(
-        grid,
-        scene_scale=scale,
-        config=hybrid_config,
     )
     representative_ids = set()
     for layer in ("low", "medium", "high"):
@@ -847,6 +895,12 @@ def main() -> None:
             "complexity_layer": trial["complexity_layer"],
             "start_yaw_rad": trial["start_yaw_rad"],
             "goal_yaw_rad": trial["goal_yaw_rad"],
+            "feasible_start_primitive_count": trial[
+                "feasible_start_primitive_count"
+            ],
+            "feasible_start_primitive_indices": trial[
+                "feasible_start_primitive_indices"
+            ],
             "success": False,
             "failure_reason": None,
         }
@@ -944,6 +998,18 @@ def main() -> None:
             "preprocessing": preprocessing,
             "endpoint_selection": endpoint_info,
             "candidate_generation": candidate_info,
+            "start_pose_prefilter": {
+                "definition": (
+                    "exclude a collision-free start pose when every configured "
+                    "forward Hybrid A* motion primitive collides"
+                ),
+                "generated_candidate_count": int(len(candidates)),
+                "eligible_candidate_count": int(len(eligible_candidates)),
+                "excluded_candidate_count": int(
+                    len(excluded_start_poses)
+                ),
+                "formal_selected_count": int(len(selected)),
+            },
             "physical_parameters": {
                 "robot_height_m": args.robot_height_meters,
                 "footprint_radius_m": args.footprint_radius_meters,
@@ -965,6 +1031,7 @@ def main() -> None:
                 ),
                 "continuous_posthoc_collision_review": False,
                 "main_pipeline_modified": False,
+                "zero_forward_primitive_starts_in_formal_sample": False,
                 "direction_preservation_note": (
                     "Compression is independently applied inside each "
                     "forward/reverse run. The current Hybrid A* planner is "

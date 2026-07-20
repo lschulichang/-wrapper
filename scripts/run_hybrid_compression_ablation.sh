@@ -60,6 +60,10 @@ cat > "$RUN_DIR/notes.md" <<'EOF'
 
 - The main planner is not changed by this experiment.
 - Thirty deterministic old_union endpoint pairs are shared by both variants.
+- Before stratified selection, a collision-free start pose is excluded when
+  all configured forward motion primitives collide. Exclusions are archived
+  in assets/excluded_start_poses.json and are not counted in the formal
+  30-trial success-rate denominator.
 - Each trial runs Hybrid A* once, then reuses the exact same dense coarse path.
 - Variant A passes the dense Hybrid A* XY samples directly to corridor construction.
 - Variant B splits the pose sequence at every forward/reverse change and applies conservative integer-supercover LOS compression independently inside each motion-direction run.
