@@ -19,6 +19,7 @@ from ground_nav.corridor_2d import PlanarCollisionSet, build_planar_corridor  # 
 from ground_nav.hybrid_astar import (  # noqa: E402
     HybridAStarConfig,
     HybridAStarPlanner,
+    _Record,
 )
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
 
@@ -132,6 +133,40 @@ class HybridAStarTest(unittest.TestCase):
         self.assertTrue(np.all(~grid.occupied[indices[:, 0], indices[:, 1]].numpy()))
         self.assertGreater(float(np.max(result.poses_scene[:, 1])), 17.5)
         self.assertGreater(result.expanded_nodes, 1)
+
+    def test_reconstruction_uses_immutable_parent_edges(self):
+        planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
+        start = np.asarray([2.5, 2.5, 0.0])
+        first_edge = np.asarray([[3.0, 2.5, 0.0], [4.0, 2.5, 0.0]])
+        second_edge = np.asarray([[4.5, 2.5, 0.0], [5.5, 2.5, 0.0]])
+        replacement_edge = np.asarray([[3.0, 3.0, 0.2], [4.0, 3.5, 0.2]])
+        records = [
+            _Record(start, 0.0, None, None, 0.0, planner.straight_index),
+            _Record(first_edge[-1], 1.0, 0, first_edge, 0.0, planner.straight_index),
+            _Record(second_edge[-1], 2.0, 1, second_edge, 0.0, planner.straight_index),
+            # This represents a later lower-cost replacement for the same
+            # discretized key as record 1. Existing descendants must keep
+            # following record 1 and its already validated edge.
+            _Record(
+                replacement_edge[-1],
+                0.5,
+                0,
+                replacement_edge,
+                0.0,
+                planner.straight_index,
+            ),
+        ]
+        result = planner._reconstruct(
+            records,
+            2,
+            (np.asarray([second_edge[-1]]), np.empty(0), 0.0),
+            expanded_nodes=3,
+            generated_nodes=4,
+            goal_heading_constrained=False,
+        )
+        expected = np.vstack([start, first_edge, second_edge])
+        np.testing.assert_allclose(result.poses_scene, expected, atol=1e-12)
+        self.assertFalse(np.any(np.isclose(result.poses_scene[:, 1], 3.5)))
 
     def test_dense_hybrid_seed_enters_existing_corridor_without_extra_checks(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())

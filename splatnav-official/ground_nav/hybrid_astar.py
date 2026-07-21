@@ -124,11 +124,12 @@ class HybridPath:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Record:
     state: np.ndarray
     g_m: float
-    parent: tuple[int, int, int] | None
+    parent_record_id: int | None
+    edge_samples: np.ndarray | None
     curvature_scene: float
     steering_index: int
 
@@ -534,33 +535,33 @@ class HybridAStarPlanner:
 
     def _reconstruct(
         self,
-        records: dict[tuple[int, int, int], _Record],
-        terminal_key: tuple[int, int, int],
+        records: list[_Record],
+        terminal_record_id: int,
         analytic: tuple[np.ndarray, np.ndarray, float],
         expanded_nodes: int,
         generated_nodes: int,
         goal_heading_constrained: bool,
     ) -> HybridPath:
-        keys = []
-        key = terminal_key
-        while key is not None:
-            keys.append(key)
-            key = records[key].parent
-        keys.reverse()
-        node_poses = np.stack([records[item].state for item in keys])
+        record_ids = []
+        record_id: int | None = terminal_record_id
+        while record_id is not None:
+            record_ids.append(record_id)
+            record_id = records[record_id].parent_record_id
+        record_ids.reverse()
+        node_poses = np.stack([records[item].state for item in record_ids])
         dense = [node_poses[0]]
         primitive_curvatures_m = []
-        for parent_key, child_key in zip(keys[:-1], keys[1:]):
-            parent = records[parent_key]
-            child = records[child_key]
-            samples = self._sample_motion(
-                parent.state,
-                child.curvature_scene,
-                self.primitive_length_scene,
-                collision_check=False,
-            )
-            if samples is None:
-                raise RuntimeError("failed to reconstruct a validated Hybrid A* edge")
+        for parent_record_id, child_record_id in zip(
+            record_ids[:-1], record_ids[1:]
+        ):
+            child = records[child_record_id]
+            if child.parent_record_id != parent_record_id:
+                raise RuntimeError("invalid immutable Hybrid A* parent chain")
+            samples = child.edge_samples
+            if samples is None or len(samples) == 0:
+                raise RuntimeError("validated Hybrid A* edge samples are missing")
+            if not np.allclose(samples[-1], child.state, atol=1e-12, rtol=0.0):
+                raise RuntimeError("validated Hybrid A* edge endpoint is inconsistent")
             dense.extend(samples)
             primitive_curvatures_m.append(child.curvature_scene * self.scene_scale)
 
@@ -573,13 +574,19 @@ class HybridAStarPlanner:
         if np.any(duplicate):
             keep = np.concatenate([[True], ~duplicate])
             dense_array = dense_array[keep]
+        if any(not self._state_is_free(pose) for pose in dense_array):
+            raise RuntimeError(
+                "validated Hybrid A* reconstruction contains an occupied sample"
+            )
         return HybridPath(
             poses_scene=dense_array,
             node_poses_scene=np.vstack([node_poses, analytic_poses[-1]]),
             primitive_curvatures_1pm=np.asarray(
                 primitive_curvatures_m, dtype=np.float64
             ),
-            total_cost_m=float(records[terminal_key].g_m + analytic_cost_m),
+            total_cost_m=float(
+                records[terminal_record_id].g_m + analytic_cost_m
+            ),
             expanded_nodes=expanded_nodes,
             generated_nodes=generated_nodes,
             analytic_expansion_used=True,
@@ -631,17 +638,19 @@ class HybridAStarPlanner:
         start_key = self._state_key(start)
         if start_key is None:
             raise RuntimeError("failed to index a valid start pose")
-        records = {
-            start_key: _Record(
+        records = [
+            _Record(
                 state=start,
                 g_m=0.0,
-                parent=None,
+                parent_record_id=None,
+                edge_samples=None,
                 curvature_scene=0.0,
                 steering_index=self.straight_index,
             )
-        }
+        ]
+        best_record_ids = {start_key: 0}
         start_h = self._heuristic_m(start, goal, goal_cost_scene)
-        queue = [(start_h, 0.0, 0, start_key)]
+        queue = [(start_h, 0.0, 0, start_key, 0)]
         serial = 0
         expanded_nodes = 0
         generated_nodes = 1
@@ -651,9 +660,11 @@ class HybridAStarPlanner:
         )
 
         while queue and expanded_nodes < self.config.max_expansions:
-            _, queued_g, _, key = heapq.heappop(queue)
-            record = records.get(key)
-            if record is None or queued_g > record.g_m + 1e-12:
+            _, queued_g, _, key, record_id = heapq.heappop(queue)
+            if best_record_ids.get(key) != record_id:
+                continue
+            record = records[record_id]
+            if queued_g > record.g_m + 1e-12:
                 continue
             expanded_nodes += 1
             distance_to_goal = float(np.linalg.norm(record.state[:2] - goal[:2]))
@@ -674,7 +685,7 @@ class HybridAStarPlanner:
                 if analytic is not None:
                     return self._reconstruct(
                         records,
-                        key,
+                        record_id,
                         analytic,
                         expanded_nodes,
                         generated_nodes,
@@ -704,24 +715,37 @@ class HybridAStarPlanner:
                     * abs(fraction - previous_fraction)
                 )
                 child_g = record.g_m + edge_cost
-                previous = records.get(child_key)
-                if previous is not None and child_g + 1e-12 >= previous.g_m:
-                    continue
+                previous_record_id = best_record_ids.get(child_key)
+                if previous_record_id is not None:
+                    previous = records[previous_record_id]
+                    if child_g + 1e-12 >= previous.g_m:
+                        continue
                 heuristic = self._heuristic_m(child_state, goal, goal_cost_scene)
                 if not np.isfinite(heuristic):
                     continue
-                records[child_key] = _Record(
-                    state=child_state,
-                    g_m=child_g,
-                    parent=key,
-                    curvature_scene=float(curvature_scene),
-                    steering_index=steering_index,
+                child_record_id = len(records)
+                records.append(
+                    _Record(
+                        state=child_state,
+                        g_m=child_g,
+                        parent_record_id=record_id,
+                        edge_samples=samples.copy(),
+                        curvature_scene=float(curvature_scene),
+                        steering_index=steering_index,
+                    )
                 )
+                best_record_ids[child_key] = child_record_id
                 serial += 1
                 generated_nodes += 1
                 heapq.heappush(
                     queue,
-                    (child_g + heuristic, child_g, serial, child_key),
+                    (
+                        child_g + heuristic,
+                        child_g,
+                        serial,
+                        child_key,
+                        child_record_id,
+                    ),
                 )
 
         if expanded_nodes >= self.config.max_expansions:
