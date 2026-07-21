@@ -149,11 +149,6 @@ def compress_direction_preserving(
     return result, diagnostics
 
 
-def goal_yaw(reference_path: np.ndarray) -> float:
-    last = reference_path[-1] - reference_path[-2]
-    return float(math.atan2(last[1], last[0]))
-
-
 def path_turn_count(path: np.ndarray) -> int:
     if len(path) < 3:
         return 0
@@ -410,6 +405,7 @@ def run_variant(
         "direct_distance_m": trial["direct_distance_m"],
         "reference_turn_count": trial["reference_turn_count"],
         "variant": variant,
+        "terminal_yaw_rad": float(goal_yaw),
         "success": False,
         "failure_stage": None,
         "failure_reason": None,
@@ -1011,9 +1007,7 @@ def main() -> None:
     )
     for candidate in candidates:
         candidate["start_yaw_rad"] = fixed_start_yaw
-        candidate["goal_yaw_rad"] = goal_yaw(
-            candidate["reference_path"]
-        )
+        candidate["goal_heading_mode"] = "free"
     selected = select_distance_turn_stratified(
         candidates,
         args.sample_count,
@@ -1075,7 +1069,8 @@ def main() -> None:
             "direct_distance_m": trial["direct_distance_m"],
             "reference_turn_count": trial["reference_turn_count"],
             "start_yaw_rad": trial["start_yaw_rad"],
-            "goal_yaw_rad": trial["goal_yaw_rad"],
+            "goal_heading_mode": "free",
+            "requested_goal_yaw_rad": None,
             "success": False,
             "failure_reason": None,
         }
@@ -1087,15 +1082,15 @@ def main() -> None:
                     *trial["start_scene"],
                     trial["start_yaw_rad"],
                 ],
-                [
-                    *trial["goal_scene"],
-                    trial["goal_yaw_rad"],
-                ],
+                trial["goal_scene"],
             )
             search_record["time_hybrid_astar_s"] = (
                 time.perf_counter() - begin
             )
             search_record.update(hybrid_path.summary())
+            search_record["terminal_yaw_rad"] = float(
+                hybrid_path.poses_scene[-1, 2]
+            )
             search_record["success"] = True
         except Exception as error:
             search_record["failure_reason"] = str(error)
@@ -1129,7 +1124,7 @@ def main() -> None:
                 scale=scale,
                 max_segment_scene=args.max_segment_meters * scale,
                 start_yaw=trial["start_yaw_rad"],
-                goal_yaw=trial["goal_yaw_rad"],
+                goal_yaw=float(hybrid_path.poses_scene[-1, 2]),
                 dense_samples=args.dense_samples,
                 device=device,
             )
@@ -1203,9 +1198,9 @@ def main() -> None:
                     "from 0.05 to 0.95 per distance stratum"
                 ),
                 "endpoint_yaw_source": (
-                    "fixed verified start yaw; goal yaw from the last segment "
-                    "of the deterministic ellipse-distance Dijkstra "
-                    "reference path"
+                    "fixed verified start yaw; goal yaw unconstrained during "
+                    "Hybrid A* and inherited by Bezier from the selected "
+                    "Hybrid A* terminal pose"
                 ),
                 "continuous_posthoc_collision_review": False,
                 "main_pipeline_modified": False,

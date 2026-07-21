@@ -56,6 +56,7 @@ class HybridAStarConfig:
     steering_change_cost_weight: float = 0.10
     analytic_expansion_interval: int = 50
     analytic_expansion_distance_cells: float = 12.0
+    free_goal_heading_bins: int = 24
     max_expansions: int = 200_000
 
     def __post_init__(self) -> None:
@@ -79,6 +80,8 @@ class HybridAStarConfig:
             raise ValueError("analytic_expansion_interval must be positive")
         if self.analytic_expansion_distance_cells <= 0.0:
             raise ValueError("analytic_expansion_distance_cells must be positive")
+        if self.free_goal_heading_bins < 4:
+            raise ValueError("free_goal_heading_bins must be at least 4")
         if self.max_expansions <= 0:
             raise ValueError("max_expansions must be positive")
 
@@ -94,6 +97,7 @@ class HybridPath:
     expanded_nodes: int
     generated_nodes: int
     analytic_expansion_used: bool
+    goal_heading_constrained: bool
     config: dict
 
     @property
@@ -114,6 +118,8 @@ class HybridPath:
             "expanded_nodes": int(self.expanded_nodes),
             "generated_nodes": int(self.generated_nodes),
             "analytic_expansion_used": bool(self.analytic_expansion_used),
+            "goal_heading_constrained": bool(self.goal_heading_constrained),
+            "terminal_yaw_rad": float(self.poses_scene[-1, 2]),
             "config": dict(self.config),
         }
 
@@ -452,6 +458,58 @@ class HybridAStarPlanner:
         poses[-1] = goal
         return poses, curvatures_m, total_scene / self.scene_scale
 
+    def _analytic_expansion_free_heading(
+        self,
+        state: np.ndarray,
+        goal_xy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float] | None:
+        """Connect to an exact goal position while choosing the terminal yaw."""
+
+        delta = np.asarray(goal_xy, dtype=np.float64) - state[:2]
+        bearing = (
+            math.atan2(float(delta[1]), float(delta[0]))
+            if np.linalg.norm(delta) > 1e-12
+            else float(state[2])
+        )
+        regular = np.linspace(
+            -math.pi,
+            math.pi,
+            self.config.free_goal_heading_bins,
+            endpoint=False,
+            dtype=np.float64,
+        )
+        headings = np.concatenate(
+            [regular, [wrap_angle(state[2]), wrap_angle(bearing)]]
+        )
+        unique_headings = []
+        seen = set()
+        for heading in headings:
+            key = int(round(wrap_angle(float(heading)) * 1e12))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_headings.append(wrap_angle(float(heading)))
+
+        candidates = []
+        for heading in unique_headings:
+            goal = np.asarray(
+                [goal_xy[0], goal_xy[1], heading],
+                dtype=np.float64,
+            )
+            solution = self._dubins_shortest(
+                state,
+                goal,
+                validate_endpoint=True,
+            )
+            if solution is not None:
+                candidates.append((solution[2], goal))
+
+        for _, goal in sorted(candidates, key=lambda item: item[0]):
+            analytic = self._analytic_expansion(state, goal)
+            if analytic is not None:
+                return analytic
+        return None
+
     def _heuristic_m(
         self,
         state: np.ndarray,
@@ -464,6 +522,8 @@ class HybridAStarPlanner:
         holonomic = float(goal_cost_scene[index]) / self.scene_scale
         if not np.isfinite(holonomic):
             return math.inf
+        if len(goal) == 2:
+            return holonomic
         dubins = self._dubins_shortest(state, goal)
         nonholonomic = (
             float(np.linalg.norm(state[:2] - goal[:2])) / self.scene_scale
@@ -479,6 +539,7 @@ class HybridAStarPlanner:
         analytic: tuple[np.ndarray, np.ndarray, float],
         expanded_nodes: int,
         generated_nodes: int,
+        goal_heading_constrained: bool,
     ) -> HybridPath:
         keys = []
         key = terminal_key
@@ -522,6 +583,7 @@ class HybridAStarPlanner:
             expanded_nodes=expanded_nodes,
             generated_nodes=generated_nodes,
             analytic_expansion_used=True,
+            goal_heading_constrained=goal_heading_constrained,
             config={**asdict(self.config), "scene_scale": self.scene_scale},
         )
 
@@ -530,10 +592,29 @@ class HybridAStarPlanner:
         start_pose: Pose2D | Sequence[float],
         goal_pose: Pose2D | Sequence[float],
     ) -> HybridPath:
-        """Return a forward-only path ending at the exact requested goal pose."""
+        """Return a path to a goal pose or to a goal position with free yaw."""
 
         start = Pose2D.from_value(start_pose).as_array()
-        goal = Pose2D.from_value(goal_pose).as_array()
+        if isinstance(goal_pose, Pose2D):
+            goal = goal_pose.as_array()
+            goal_heading_constrained = True
+        else:
+            goal_values = np.asarray(
+                goal_pose,
+                dtype=np.float64,
+            ).reshape(-1)
+            if goal_values.size not in (2, 3):
+                raise ValueError(
+                    "goal must contain x and y, with an optional yaw"
+                )
+            if not np.all(np.isfinite(goal_values)):
+                raise ValueError("goal values must be finite")
+            if goal_values.size == 2:
+                goal = goal_values
+                goal_heading_constrained = False
+            else:
+                goal = Pose2D.from_value(goal_values).as_array()
+                goal_heading_constrained = True
         start_index = self._point_index(start[:2])
         goal_index = self._point_index(goal[:2])
         if start_index is None or goal_index is None:
@@ -582,7 +663,14 @@ class HybridAStarPlanner:
                 or distance_to_goal <= analytic_distance_scene
             )
             if should_try_analytic:
-                analytic = self._analytic_expansion(record.state, goal)
+                analytic = (
+                    self._analytic_expansion(record.state, goal)
+                    if goal_heading_constrained
+                    else self._analytic_expansion_free_heading(
+                        record.state,
+                        goal[:2],
+                    )
+                )
                 if analytic is not None:
                     return self._reconstruct(
                         records,
@@ -590,6 +678,7 @@ class HybridAStarPlanner:
                         analytic,
                         expanded_nodes,
                         generated_nodes,
+                        goal_heading_constrained,
                     )
 
             previous_fraction = self.config.curvature_fractions[record.steering_index]
@@ -639,4 +728,6 @@ class HybridAStarPlanner:
             raise RuntimeError(
                 f"Hybrid A* exceeded max_expansions={self.config.max_expansions}"
             )
-        raise RuntimeError("Hybrid A* found no collision-free path to the goal pose")
+        raise RuntimeError(
+            "Hybrid A* found no collision-free path to the goal position"
+        )

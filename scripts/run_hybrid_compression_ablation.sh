@@ -81,8 +81,9 @@ cat > "$RUN_DIR/notes.md" <<EOF
 - Goals are split into near/medium/far direct-distance terciles. ${PER_LAYER}
   goals per tercile are selected across reference-path turn-count quantiles,
   for ${SAMPLE_COUNT} formal paired trials.
-- Goal yaw is the final segment direction of the deterministic Dijkstra
-  reference path. Start yaw remains fixed at pi.
+- Goal yaw is unconstrained during Hybrid A*. The downstream Bezier QP
+  inherits the terminal yaw selected by Hybrid A*. Start yaw remains fixed
+  at pi.
 - Each trial runs Hybrid A* once, then reuses the exact same dense coarse path.
 - Variant A passes the dense Hybrid A* XY samples directly to corridor construction.
 - Variant B splits the pose sequence at every forward/reverse change and applies conservative integer-supercover LOS compression independently inside each motion-direction run.

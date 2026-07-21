@@ -131,7 +131,10 @@ def main():
         "--goal-yaw-rad",
         type=float,
         default=None,
-        help="Required goal heading when --planner=hybrid_astar",
+        help=(
+            "Optional fixed goal heading for Hybrid A*; omit it to let the "
+            "planner choose the terminal heading"
+        ),
     )
     parser.add_argument(
         "--min-turning-radius-meters",
@@ -160,12 +163,16 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     if args.planner == "hybrid_astar":
-        if args.start_yaw_rad is None or args.goal_yaw_rad is None:
+        if args.start_yaw_rad is None:
             parser.error(
-                "--start-yaw-rad and --goal-yaw-rad are required "
-                "when --planner=hybrid_astar"
+                "--start-yaw-rad is required when --planner=hybrid_astar"
             )
-        if not np.isfinite(args.start_yaw_rad) or not np.isfinite(args.goal_yaw_rad):
+        if not np.isfinite(args.start_yaw_rad):
+            parser.error("Hybrid A* headings must be finite")
+        if (
+            args.goal_yaw_rad is not None
+            and not np.isfinite(args.goal_yaw_rad)
+        ):
             parser.error("Hybrid A* headings must be finite")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -329,9 +336,14 @@ def main():
             config=hybrid_config,
         )
         t0 = time.time()
+        requested_goal = (
+            [goal[0], goal[1]]
+            if args.goal_yaw_rad is None
+            else [goal[0], goal[1], args.goal_yaw_rad]
+        )
         hybrid_result = planner_hybrid.plan(
             [start[0], start[1], args.start_yaw_rad],
-            [goal[0], goal[1], args.goal_yaw_rad],
+            requested_goal,
         )
         timings["hybrid_astar"] = time.time() - t0
         raw_seed = hybrid_result.xy
@@ -352,8 +364,15 @@ def main():
                 float(start[0]), float(start[1]), float(args.start_yaw_rad)
             ],
             "goal_pose_scene": [
-                float(goal[0]), float(goal[1]), float(args.goal_yaw_rad)
+                float(goal[0]),
+                float(goal[1]),
+                float(hybrid_result.poses_scene[-1, 2]),
             ],
+            "requested_goal_yaw_rad": (
+                None
+                if args.goal_yaw_rad is None
+                else float(args.goal_yaw_rad)
+            ),
         })
         simplification_summary = {
             "method": "none_adjacent_duplicate_cleanup_only",
@@ -370,7 +389,11 @@ def main():
         simplified[0],
         simplified[-1],
         start_yaw=args.start_yaw_rad if args.planner == "hybrid_astar" else None,
-        goal_yaw=args.goal_yaw_rad if args.planner == "hybrid_astar" else None,
+        goal_yaw=(
+            float(hybrid_result.poses_scene[-1, 2])
+            if hybrid_result is not None
+            else None
+        ),
         endpoint_tangent_min=(
             0.25 * float(torch.min(grid.cell_sizes).item())
             if args.planner == "hybrid_astar"

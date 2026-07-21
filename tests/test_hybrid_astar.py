@@ -81,6 +81,18 @@ class HybridAStarTest(unittest.TestCase):
             0.5 + 1e-12,
         )
 
+    def test_free_goal_heading_reaches_exact_position(self):
+        planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
+        result = planner.plan([5.5, 5.5, 0.0], [7.5, 7.5])
+        np.testing.assert_allclose(
+            result.poses_scene[-1, :2],
+            [7.5, 7.5],
+            atol=1e-8,
+        )
+        self.assertFalse(result.goal_heading_constrained)
+        self.assertFalse(result.summary()["goal_heading_constrained"])
+        self.assertTrue(np.isfinite(result.summary()["terminal_yaw_rad"]))
+
     def test_motion_checks_intermediate_samples(self):
         grid = FakeGrid(occupied=[(6, 5)])
         planner = HybridAStarPlanner(grid, 1.0, self.config())
@@ -123,7 +135,7 @@ class HybridAStarTest(unittest.TestCase):
 
     def test_dense_hybrid_seed_enters_existing_corridor_without_extra_checks(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
-        result = planner.plan([2.5, 2.5, 0.0], [12.5, 2.5, 0.0])
+        result = planner.plan([2.5, 2.5, 0.0], [12.5, 2.5])
         collision_set = PlanarCollisionSet(
             empty_ellipses(),
             radius=0.25,
@@ -136,7 +148,7 @@ class HybridAStarTest(unittest.TestCase):
             result.xy[0],
             result.xy[-1],
             start_yaw=0.0,
-            goal_yaw=0.0,
+            goal_yaw=float(result.poses_scene[-1, 2]),
             endpoint_tangent_min=0.05,
         )
         self.assertTrue(feasible)
