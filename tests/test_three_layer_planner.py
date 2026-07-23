@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -85,17 +86,15 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
         self.assertTrue(result.search_success)
         self.assertTrue(result.corridor_success)
         self.assertTrue(result.optimization_success)
-        self.assertTrue(result.grid_safe)
-        self.assertTrue(result.continuous_safe)
+        self.assertTrue(result.corridor_feasible)
         self.assertTrue(result.curvature_feasible)
         self.assertTrue(result.curvature_rate_feasible)
         self.assertFalse(result.fallback_used)
-        self.assertIsNone(result.tracking_success)
         self.assertEqual(
             len(result.corridor.path_to_corridor),
             len(result.hybrid_path.poses_scene),
         )
-        self.assertGreater(len(result.dense_trajectory_poses_scene), 2)
+        self.assertGreater(len(result.dense_output_poses_scene), 2)
 
     def test_optimizer_failure_uses_safe_hybrid_only_as_degraded_output(self):
         result = self.build(max_iterations=1).plan(
@@ -106,8 +105,13 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
         self.assertFalse(result.optimization_success)
         self.assertTrue(result.fallback_used)
         self.assertFalse(result.success)
-        self.assertEqual(result.failure_stage, "optimization")
-        self.assertEqual(len(result.trajectory_poses_scene), 0)
+        self.assertEqual(
+            result.failure_stage, "curvature_collocation"
+        )
+        np.testing.assert_allclose(
+            result.output_poses_scene,
+            result.hybrid_path.poses_scene,
+        )
         self.assertIsNotNone(result.hybrid_path)
 
 

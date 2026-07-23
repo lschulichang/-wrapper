@@ -39,7 +39,6 @@ class TrajectoryOptimizerConfig:
     dense_samples_per_segment: int = 8
     max_refinement_steps: int = 2
     refinement_factor: float = 1.5
-    curvature_rate_relaxation: float = 1.5
 
     def __post_init__(self) -> None:
         if self.node_count < 4:
@@ -64,8 +63,6 @@ class TrajectoryOptimizerConfig:
             raise ValueError("dense_samples_per_segment must be at least two")
         if self.max_refinement_steps < 0 or self.refinement_factor <= 1.0:
             raise ValueError("invalid refinement settings")
-        if self.curvature_rate_relaxation < 1.0:
-            raise ValueError("curvature_rate_relaxation must be at least one")
 
 
 @dataclass(frozen=True)
@@ -306,8 +303,6 @@ class CurvatureTrajectoryOptimizer:
                 math.ceil(self.config.node_count * self.config.refinement_factor**attempt)
             )
             rate_limit = float(max_curvature_rate)
-            if attempt == self.config.max_refinement_steps and attempt > 0:
-                rate_limit *= self.config.curvature_rate_relaxation
             (
                 reference_nodes,
                 reference_node_arc,
@@ -614,27 +609,3 @@ class CurvatureTrajectoryOptimizer:
             dense_arc_length=np.empty(0),
             diagnostics=list(diagnostics),
         )
-
-
-def optimize(
-    reference_path,
-    corridors,
-    path_to_corridor,
-    start_pose,
-    goal_xy,
-    min_turning_radius,
-    max_curvature_rate,
-    *,
-    config: TrajectoryOptimizerConfig | None = None,
-) -> TrajectoryResult:
-    """Functional wrapper around :class:`CurvatureTrajectoryOptimizer`."""
-
-    return CurvatureTrajectoryOptimizer(config).optimize(
-        reference_path,
-        corridors,
-        path_to_corridor,
-        start_pose,
-        goal_xy,
-        min_turning_radius,
-        max_curvature_rate,
-    )

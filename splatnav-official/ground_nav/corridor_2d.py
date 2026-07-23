@@ -99,32 +99,21 @@ class PlanarCollisionSet:
         self,
         ellipses,
         radius: float,
-        corridor_margin: float | None = None,
+        stopping_distance: float,
         iterations: int = 10,
-        *,
-        stopping_distance: float | None = None,
     ):
         """Construct a paper-style local collision set.
 
-        ``stopping_distance`` is the preferred name for the post-footprint
-        corridor extent. ``corridor_margin`` remains as a compatibility alias.
         The unshrunk candidate box uses ``radius + stopping_distance``; after
         shrinking its faces by ``radius``, the seed segment retains exactly the
         stopping-distance extent used by the original Splat-Plan construction.
         """
 
-        if stopping_distance is None:
-            if corridor_margin is None:
-                raise ValueError("stopping_distance is required")
-            stopping_distance = corridor_margin
-        elif corridor_margin is not None and not np.isclose(corridor_margin, stopping_distance):
-            raise ValueError("corridor_margin and stopping_distance disagree")
         if radius < 0 or stopping_distance < 0:
             raise ValueError("radius and stopping_distance must be non-negative")
         self.ellipses = ellipses
         self.radius = float(radius)
         self.stopping_distance = float(stopping_distance)
-        self.corridor_margin = self.stopping_distance  # Backward-compatible result readers.
         self.iterations = int(iterations)
         self.device = ellipses.means.device
 
@@ -162,11 +151,6 @@ class PlanarCollisionSet:
             data["segment"], data["rots"], data["scales"], data["means"], self.radius, self.iterations
         )
 
-    def segment_is_safe(self, segment) -> bool:
-        result = self.exact_test(segment)
-        return bool(torch.all(result["is_not_intersect"]).item())
-
-
 def _supporting_line(delta, Q, K, mean):
     delta_Q = Q @ delta
     rhs = torch.sqrt(K.clamp_min(0.0)) + torch.dot(delta_Q, mean)
@@ -184,16 +168,6 @@ class CorridorResult:
     reference_heading: np.ndarray | None
     source_segment_indices: list[int]
     diagnostics: list[dict]
-
-    @property
-    def polygons(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Compatibility alias used by the existing Bezier planner."""
-
-        return self.corridors
-
-
-# Backward-compatible public name retained for existing callers.
-PlanarCorridor = CorridorResult
 
 
 def build_planar_corridor(

@@ -14,7 +14,6 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "splatnav-official"))
 
-from ground_nav.bezier_2d import BezierPlanner2D  # noqa: E402
 from ground_nav.corridor_2d import PlanarCollisionSet, build_planar_corridor  # noqa: E402
 from ground_nav.hybrid_astar import (  # noqa: E402
     HybridAStarConfig,
@@ -172,7 +171,7 @@ class HybridAStarTest(unittest.TestCase):
         np.testing.assert_allclose(result.poses_scene, expected, atol=1e-12)
         self.assertFalse(np.any(np.isclose(result.poses_scene[:, 1], 3.5)))
 
-    def test_dense_hybrid_seed_enters_existing_corridor_without_extra_checks(self):
+    def test_dense_hybrid_seed_has_ordered_corridor_mapping(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
         result = planner.plan([2.5, 2.5, 0.0], [12.5, 2.5])
         collision_set = PlanarCollisionSet(
@@ -181,31 +180,17 @@ class HybridAStarTest(unittest.TestCase):
             stopping_distance=2.0,
         )
         corridor = build_planar_corridor(result.poses_scene, collision_set)
-        self.assertEqual(len(corridor.path_to_corridor), len(result.poses_scene))
+        self.assertEqual(
+            len(corridor.path_to_corridor),
+            len(result.poses_scene),
+        )
         self.assertTrue(np.all(np.diff(corridor.path_to_corridor) >= 0))
         np.testing.assert_allclose(
             corridor.reference_heading,
             result.poses_scene[:, 2],
         )
         self.assertTrue(all(row["valid"] for row in corridor.overlaps))
-        bezier = BezierPlanner2D(degree=6, continuity_order=3)
-        controls, feasible = bezier.optimize(
-            corridor.polygons,
-            result.xy[0],
-            result.xy[-1],
-            start_yaw=0.0,
-            goal_yaw=float(result.poses_scene[-1, 2]),
-            endpoint_tangent_min=0.05,
-        )
-        self.assertTrue(feasible)
-        self.assertIsNotNone(controls)
-        self.assertGreaterEqual(len(corridor.polygons), 1)
-        start_tangent = controls[0, :, 1] - controls[0, :, 0]
-        goal_tangent = controls[-1, :, -1] - controls[-1, :, -2]
-        self.assertGreaterEqual(start_tangent[0], 0.05 - 1e-7)
-        self.assertGreaterEqual(goal_tangent[0], 0.05 - 1e-7)
-        self.assertAlmostEqual(start_tangent[1], 0.0, places=8)
-        self.assertAlmostEqual(goal_tangent[1], 0.0, places=8)
+        self.assertGreaterEqual(len(corridor.corridors), 1)
 
 
 if __name__ == "__main__":

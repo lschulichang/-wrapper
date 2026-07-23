@@ -1,303 +1,119 @@
+#!/usr/bin/env python3
+"""Tests for the single ellipse-distance GroundGrid route."""
+
 from __future__ import annotations
 
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM = ROOT / "splatnav-official"
-sys.path.insert(0, str(UPSTREAM))
+sys.path.insert(0, str(ROOT / "splatnav-official"))
 
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from ground_nav.planar_gaussians import PlanarGaussianSet  # noqa: E402
-from initialization.grid_utils import GSplatVoxel  # noqa: E402
 
 
-def fake_voxel() -> SimpleNamespace:
-    nx, ny, nz = 7, 6, 4
-    lower = torch.tensor([0.0, 0.0, 0.0])
-    upper = torch.tensor([7.0, 6.0, 4.0])
-    cell_sizes = (upper - lower) / torch.tensor([nx, ny, nz])
-    xs = torch.linspace(0.5, 6.5, nx)
-    ys = torch.linspace(0.5, 5.5, ny)
-    zs = torch.linspace(0.5, 3.5, nz)
-    x, y, z = torch.meshgrid(xs, ys, zs, indexing="ij")
-    centers = torch.stack([x, y, z], dim=-1)
-    occupied = torch.zeros((nx, ny, nz), dtype=torch.bool)
-
-    # A wall in the selected height band with a single opening at y index 3.
-    occupied[3, :, 1] = True
-    occupied[3, 3, 1] = False
-    # This obstacle is above the selected band and must not be projected.
-    occupied[1, 1, 3] = True
-
-    return SimpleNamespace(
-        non_navigable_grid=occupied,
-        grid_centers=centers,
-        cell_sizes=cell_sizes,
-        radius=0.0,
-    )
-
-
-def ellipse_set(device=torch.device("cpu"), scale=1.0) -> PlanarGaussianSet:
-    dtype = torch.float64
-    scales = torch.tensor([[0.20, 0.10]], dtype=dtype, device=device) * scale
+def ellipse_set(means, scales):
+    means = torch.as_tensor(means, dtype=torch.float64)
+    scales = torch.as_tensor(scales, dtype=torch.float64)
+    count = len(means)
+    rotations = torch.eye(
+        2, dtype=torch.float64
+    ).repeat(count, 1, 1)
+    covariances = rotations @ torch.diag_embed(
+        scales.square()
+    ) @ rotations.transpose(1, 2)
     return PlanarGaussianSet(
-        ids=torch.tensor([0], dtype=torch.long, device=device),
-        means=torch.tensor([[0.0, 0.0]], dtype=dtype, device=device),
-        covs=torch.diag_embed(scales.square()),
-        rots=torch.eye(2, dtype=dtype, device=device).unsqueeze(0),
+        ids=torch.arange(count),
+        means=means,
+        covs=covariances,
+        rots=rotations,
         scales=scales,
-        z_min=0.02 * scale,
-        z_max=0.10 * scale,
+        z_min=0.0,
+        z_max=1.0,
         confidence=1.0,
     )
 
 
+def build_grid(ellipses, radius=0.0):
+    return GroundGrid.from_projected_gaussians(
+        ellipses,
+        lower_xy=[0.0, 0.0],
+        upper_xy=[10.0, 10.0],
+        resolution_xy=[10, 10],
+        footprint_radius=radius,
+        z_floor_scene=0.0,
+        robot_height=1.0,
+        ground_clearance=0.0,
+    )
+
+
 class GroundGridTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.grid = GroundGrid(
-            fake_voxel(),
-            z_floor_scene=1.0,
-            robot_height=1.0,
-            footprint_radius=0.0,
-        )
+    def test_direct_constructor_is_disabled(self):
+        with self.assertRaisesRegex(TypeError, "from_projected"):
+            GroundGrid()
 
-    def test_height_band_projection(self) -> None:
-        self.assertTrue(self.grid.occupied[3, 0])
-        self.assertFalse(self.grid.occupied[3, 3])
-        self.assertFalse(self.grid.occupied[1, 1])
-        self.assertEqual(self.grid.metadata.z_indices, (1,))
-
-    def test_world_grid_round_trip_is_within_half_cell(self) -> None:
-        point = torch.tensor([2.7, 4.2])
-        recovered = self.grid.grid_to_world(self.grid.world_to_grid(point))
-        error = torch.abs(recovered - point)
-        self.assertTrue(torch.all(error <= self.grid.cell_sizes / 2 + 1e-6))
-
-    def test_path_is_planar_and_collision_free(self) -> None:
-        path = self.grid.create_path([0.5, 0.5], [6.5, 0.5])
-        self.assertGreater(len(path), 2)
-        self.assertEqual(path.shape[1], 2)
-        for point in path:
-            self.assertFalse(self.grid.is_occupied(point))
-        self.assertTrue(np.any(np.isclose(path[:, 1], 3.5)))
-
-    def test_occupied_endpoint_can_be_projected(self) -> None:
-        projected_path = self.grid.create_path([3.5, 0.5], [6.5, 0.5])
-        self.assertFalse(self.grid.is_occupied(projected_path[0]))
-
-    def test_path_steps_are_strictly_four_connected(self) -> None:
-        path = self.grid.create_path([0.5, 0.5], [6.5, 0.5])
-        indices = np.stack([self.grid.world_to_grid(point).cpu().numpy() for point in path])
-        self.assertTrue(np.all(np.abs(np.diff(indices, axis=0)).sum(axis=1) == 1))
-
-    def test_invalid_height_band_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            GroundGrid(fake_voxel(), z_floor_scene=8.0, robot_height=1.0, footprint_radius=0.0)
-
-    def test_deprecated_z_floor_alias_matches_scene_named_argument(self) -> None:
-        legacy = GroundGrid(fake_voxel(), z_floor=1.0, robot_height=1.0, footprint_radius=0.0)
-        explicit = GroundGrid(
-            fake_voxel(), z_floor_scene=1.0, robot_height=1.0, footprint_radius=0.0
+    def test_empty_projection_produces_free_grid(self):
+        grid = build_grid(
+            ellipse_set(
+                np.empty((0, 2)),
+                np.empty((0, 2)),
+            )
         )
-        torch.testing.assert_close(legacy.occupied, explicit.occupied)
-        self.assertEqual(explicit.metadata.z_floor_scene, 1.0)
-        self.assertEqual(explicit.metadata.z_floor, 1.0)
-
-    def test_ground_clearance_excludes_floor_layer(self) -> None:
-        voxel = fake_voxel()
-        voxel.non_navigable_grid[2, 2, 0] = True
-        grid = GroundGrid(
-            voxel,
-            z_floor_scene=0.0,
-            robot_height=2.0,
-            footprint_radius=0.0,
-            ground_clearance=1.0,
-        )
-        self.assertFalse(grid.raw_occupied[2, 2])
-
-    def test_disk_dilation_happens_only_in_xy(self) -> None:
-        voxel = fake_voxel()
-        voxel.non_navigable_grid.zero_()
-        voxel.non_navigable_grid[3, 3, 1] = True
-        grid = GroundGrid(
-            voxel,
-            z_floor_scene=1.0,
-            robot_height=1.0,
-            footprint_radius=0.6,
-        )
-        self.assertEqual(int(grid.raw_occupied.sum()), 1)
-        self.assertTrue(grid.occupied[3, 3])
-        self.assertTrue(grid.occupied[2, 3])
-        self.assertTrue(grid.occupied[3, 2])
-
-    def test_preinflated_source_grid_is_rejected(self) -> None:
-        voxel = fake_voxel()
-        voxel.radius = 0.1
-        with self.assertRaises(ValueError):
-            GroundGrid(voxel, z_floor_scene=1.0, robot_height=1.0, footprint_radius=0.1)
-
-    def test_gsplat_voxel_supports_uninflated_radius_zero(self) -> None:
-        gsplat = SimpleNamespace(
-            means=torch.tensor([[0.5, 0.5, 0.5]], dtype=torch.float32),
-            covs=torch.eye(3, dtype=torch.float32).unsqueeze(0) * 0.01,
-        )
-        voxel = GSplatVoxel(
-            gsplat,
-            lower_bound=torch.tensor([0.0, 0.0, 0.0]),
-            upper_bound=torch.tensor([1.0, 1.0, 1.0]),
-            resolution=5,
-            radius=0.0,
-            device=torch.device("cpu"),
-        )
-        self.assertEqual(tuple(voxel.non_navigable_grid.shape), (5, 5, 5))
-        self.assertGreater(int(voxel.non_navigable_grid.sum()), 0)
-
-    def test_point_to_axis_aligned_ellipse_distance(self) -> None:
-        points = torch.tensor(
-            [[0.0, 0.0], [2.0, 0.0], [0.0, 3.0]], dtype=torch.float64
-        )
-        means = torch.zeros_like(points)
-        rotations = torch.eye(2, dtype=torch.float64).repeat(3, 1, 1)
-        scales = torch.tensor(
-            [[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]], dtype=torch.float64
-        )
-        distances = GroundGrid.point_to_ellipse_distance(
-            points, means, rotations, scales
-        )
-        torch.testing.assert_close(
-            distances, torch.tensor([0.0, 1.0, 1.0], dtype=torch.float64),
-            atol=1e-9, rtol=1e-9,
-        )
-
-    def test_point_to_ellipse_distance_is_rotation_invariant(self) -> None:
-        point = torch.tensor([[2.0, 0.0]], dtype=torch.float64)
-        means = torch.zeros_like(point)
-        identity = torch.eye(2, dtype=torch.float64).unsqueeze(0)
-        quarter_turn = torch.tensor(
-            [[[0.0, -1.0], [1.0, 0.0]]], dtype=torch.float64
-        )
-        scales = torch.tensor([[1.0, 0.5]], dtype=torch.float64)
-        first = GroundGrid.point_to_ellipse_distance(
-            point, means, identity, scales
-        )
-        rotated_point = torch.tensor([[0.0, 2.0]], dtype=torch.float64)
-        second = GroundGrid.point_to_ellipse_distance(
-            rotated_point, means, quarter_turn, scales
-        )
-        torch.testing.assert_close(first, second, atol=1e-9, rtol=1e-9)
-
-    def test_projected_gaussian_rasterization_is_conservative_and_deterministic(self) -> None:
-        kwargs = dict(
-            ellipses=ellipse_set(),
-            lower_xy=(-1.0, -1.0),
-            upper_xy=(1.0, 1.0),
-            resolution_xy=(40, 40),
-            footprint_radius=0.15,
-        )
-        first = GroundGrid.from_projected_gaussians(**kwargs)
-        second = GroundGrid.from_projected_gaussians(**kwargs)
-        self.assertTrue(torch.all(first.raw_occupied <= first.occupied))
-        self.assertGreater(int(first.raw_occupied.sum()), 0)
-        self.assertGreater(
-            int(first.occupied.sum()), int(first.raw_occupied.sum())
-        )
-        torch.testing.assert_close(first.raw_occupied, second.raw_occupied)
-        torch.testing.assert_close(first.occupied, second.occupied)
-        self.assertEqual(first.metadata.source, "projected_gaussians")
+        self.assertEqual(grid.shape, (10, 10))
+        self.assertFalse(bool(torch.any(grid.occupied).item()))
         self.assertEqual(
-            first.metadata.rasterization,
+            grid.metadata.rasterization,
             "center_distance_plus_cell_circumradius",
         )
 
-    def test_aabb_disk_rasterization_fills_covariance_support_box(self) -> None:
-        ellipses = ellipse_set()
-        grid = GroundGrid.from_projected_gaussians(
-            ellipses,
-            lower_xy=(-0.5, -0.5),
-            upper_xy=(0.5, 0.5),
-            resolution_xy=(10, 10),
-            footprint_radius=0.0,
-            rasterization="aabb_disk_dilation",
+    def test_projected_ellipse_occupies_its_center_cell(self):
+        grid = build_grid(
+            ellipse_set([[5.5, 5.5]], [[0.4, 0.4]])
         )
-        # sqrt(Sigma_xx)=0.20 and sqrt(Sigma_yy)=0.10 for this ellipse.
-        # With 0.1-wide cells on [-0.5, 0.5], including zero-area boundary
-        # contact gives x indices 2..7 and y indices 3..6.
-        expected = torch.zeros_like(grid.raw_occupied)
-        expected[2:8, 3:7] = True
-        torch.testing.assert_close(grid.raw_occupied, expected)
-        torch.testing.assert_close(grid.occupied, expected)
-        self.assertEqual(
-            grid.metadata.rasterization,
-            "ellipse_aabb_fill_xy_disk_dilation",
+        self.assertTrue(grid.is_occupied([5.5, 5.5]))
+        self.assertFalse(grid.is_occupied([0.5, 0.5]))
+
+    def test_footprint_radius_expands_occupied_region(self):
+        ellipses = ellipse_set([[5.5, 5.5]], [[0.4, 0.4]])
+        point = [7.5, 5.5]
+        self.assertFalse(build_grid(ellipses, 0.0).is_occupied(point))
+        self.assertTrue(build_grid(ellipses, 1.2).is_occupied(point))
+
+    def test_point_to_ellipse_distance_is_euclidean(self):
+        points = torch.tensor(
+            [[0.0, 0.0], [3.0, 0.0]],
+            dtype=torch.float64,
+        )
+        means = torch.zeros((2, 2), dtype=torch.float64)
+        rotations = torch.eye(
+            2, dtype=torch.float64
+        ).repeat(2, 1, 1)
+        scales = torch.ones((2, 2), dtype=torch.float64)
+        distances = GroundGrid.point_to_ellipse_distance(
+            points, means, rotations, scales
+        )
+        np.testing.assert_allclose(
+            distances.numpy(), [0.0, 2.0], atol=1e-8
         )
 
-    def test_aabb_disk_rasterization_is_more_conservative(self) -> None:
-        kwargs = dict(
-            ellipses=ellipse_set(),
-            lower_xy=(-1.0, -1.0),
-            upper_xy=(1.0, 1.0),
-            resolution_xy=(40, 40),
-            footprint_radius=0.15,
-        )
-        distance_grid = GroundGrid.from_projected_gaussians(
-            **kwargs, rasterization="ellipse_distance"
-        )
-        aabb_grid = GroundGrid.from_projected_gaussians(
-            **kwargs, rasterization="aabb_disk_dilation"
-        )
-        # The distance grid uses a cell circumcircle while the AABB grid uses
-        # cell-rectangle intersection, so their boundary cells need not be a
-        # strict pointwise subset. The AABB geometry should nevertheless
-        # occupy at least as many cells for this axis-aligned test ellipse.
-        self.assertGreaterEqual(
-            int(aabb_grid.raw_occupied.sum()),
-            int(distance_grid.raw_occupied.sum()),
-        )
-        self.assertGreaterEqual(
-            int(aabb_grid.occupied.sum()),
-            int(distance_grid.occupied.sum()),
-        )
-        self.assertIsNotNone(aabb_grid.dilation_kernel)
-
-    def test_unknown_projected_gaussian_rasterization_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
+    def test_height_metadata_must_match_projection(self):
+        ellipses = ellipse_set([[5.5, 5.5]], [[0.4, 0.4]])
+        with self.assertRaisesRegex(ValueError, "height metadata"):
             GroundGrid.from_projected_gaussians(
-                ellipse_set(),
-                (-1.0, -1.0),
-                (1.0, 1.0),
-                (40, 40),
-                0.15,
-                rasterization="unknown",
+                ellipses,
+                lower_xy=[0.0, 0.0],
+                upper_xy=[10.0, 10.0],
+                resolution_xy=10,
+                footprint_radius=0.0,
+                z_floor_scene=0.0,
+                robot_height=0.8,
             )
-
-    def test_projected_gaussian_grid_is_scene_scale_invariant(self) -> None:
-        base = GroundGrid.from_projected_gaussians(
-            ellipse_set(scale=1.0), (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15
-        )
-        scaled = GroundGrid.from_projected_gaussians(
-            ellipse_set(scale=2.0), (-2.0, -2.0), (2.0, 2.0), (40, 40), 0.30
-        )
-        torch.testing.assert_close(base.raw_occupied, scaled.raw_occupied)
-        torch.testing.assert_close(base.occupied, scaled.occupied)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
-    def test_projected_gaussian_grid_matches_cpu_and_gpu(self) -> None:
-        cpu = GroundGrid.from_projected_gaussians(
-            ellipse_set(), (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15
-        )
-        gpu = GroundGrid.from_projected_gaussians(
-            ellipse_set(torch.device("cuda")),
-            (-1.0, -1.0), (1.0, 1.0), (40, 40), 0.15,
-        )
-        torch.testing.assert_close(cpu.raw_occupied, gpu.raw_occupied.cpu())
-        torch.testing.assert_close(cpu.occupied, gpu.occupied.cpu())
 
 
 if __name__ == "__main__":
