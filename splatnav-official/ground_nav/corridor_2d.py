@@ -174,21 +174,49 @@ def _supporting_line(delta, Q, K, mean):
 
 
 @dataclass
-class PlanarCorridor:
-    polygons: list[tuple[torch.Tensor, torch.Tensor]]
+class CorridorResult:
+    """Ordered convex corridor plus its fixed Hybrid-path correspondence."""
+
+    corridors: list[tuple[torch.Tensor, torch.Tensor]]
+    path_to_corridor: np.ndarray
+    overlaps: list[dict]
+    reference_xy: np.ndarray
+    reference_heading: np.ndarray | None
     source_segment_indices: list[int]
     diagnostics: list[dict]
 
+    @property
+    def polygons(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Compatibility alias used by the existing Bezier planner."""
 
-def build_planar_corridor(path: np.ndarray, collision_set: PlanarCollisionSet, tolerance: float = 1e-6):
+        return self.corridors
+
+
+# Backward-compatible public name retained for existing callers.
+PlanarCorridor = CorridorResult
+
+
+def build_planar_corridor(
+    path: np.ndarray,
+    collision_set: PlanarCollisionSet,
+    tolerance: float = 1e-6,
+) -> CorridorResult:
     path = np.asarray(path)
-    if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2:
-        raise ValueError("path must have shape (N, 2), N >= 2")
-    segments = np.stack([path[:-1], path[1:]], axis=1)
+    if path.ndim != 2 or path.shape[1] not in (2, 3) or len(path) < 2:
+        raise ValueError("path must have shape (N, 2) or (N, 3), N >= 2")
+    if not np.all(np.isfinite(path)):
+        raise ValueError("path values must be finite")
+    reference_xy = np.asarray(path[:, :2], dtype=np.float64)
+    reference_heading = (
+        np.asarray(path[:, 2], dtype=np.float64) if path.shape[1] == 3 else None
+    )
+    segments = np.stack([reference_xy[:-1], reference_xy[1:]], axis=1)
     polygons = []
     source_indices = []
+    segment_to_corridor = []
     diagnostics = []
     current = None
+    current_index = -1
     for index, segment_np in enumerate(segments):
         segment = torch.as_tensor(segment_np, dtype=collision_set.ellipses.means.dtype, device=collision_set.device)
         contained = False
@@ -197,6 +225,7 @@ def build_planar_corridor(path: np.ndarray, collision_set: PlanarCollisionSet, t
         create = index == 0 or index == len(segments) - 1 or not contained
         row = {"segment_index": index, "contained": contained, "created_polygon": create}
         if not create:
+            segment_to_corridor.append(current_index)
             diagnostics.append(row)
             continue
         data = collision_set.candidates(segment)
@@ -230,6 +259,70 @@ def build_planar_corridor(path: np.ndarray, collision_set: PlanarCollisionSet, t
         current = (A, b)
         polygons.append(current)
         source_indices.append(index)
+        current_index = len(polygons) - 1
+        segment_to_corridor.append(current_index)
         row.update({"candidate_count": int(data["means"].shape[0]), "halfspace_count": int(A.shape[0])})
         diagnostics.append(row)
-    return PlanarCorridor(polygons, source_indices, diagnostics)
+
+    segment_to_corridor = np.asarray(segment_to_corridor, dtype=np.int64)
+    path_to_corridor = np.empty(len(reference_xy), dtype=np.int64)
+    path_to_corridor[0] = segment_to_corridor[0]
+    if len(reference_xy) > 2:
+        # Interior nodes follow their outgoing segment. At a corridor change,
+        # the shared node is the fixed overlap witness between old and new.
+        path_to_corridor[1:-1] = segment_to_corridor[1:]
+    path_to_corridor[-1] = segment_to_corridor[-1]
+
+    overlaps = []
+    for right_index in range(1, len(polygons)):
+        left_index = right_index - 1
+        transition_segment = source_indices[right_index]
+        witness = reference_xy[transition_segment]
+        margins = []
+        for polygon_index in (left_index, right_index):
+            A, b = polygons[polygon_index]
+            witness_tensor = torch.as_tensor(
+                witness,
+                dtype=A.dtype,
+                device=A.device,
+            )
+            margins.append(float(torch.min(b - A @ witness_tensor).item()))
+        valid = min(margins) >= -tolerance
+        if not valid:
+            raise RuntimeError(
+                f"corridors {left_index} and {right_index} lack a valid "
+                "ordered overlap witness"
+            )
+        overlaps.append(
+            {
+                "left_corridor": left_index,
+                "right_corridor": right_index,
+                "reference_path_index": transition_segment,
+                "witness_xy": witness.copy(),
+                "minimum_margin": min(margins),
+                "valid": True,
+            }
+        )
+
+    for path_index, corridor_index in enumerate(path_to_corridor):
+        A, b = polygons[int(corridor_index)]
+        point = torch.as_tensor(
+            reference_xy[path_index], dtype=A.dtype, device=A.device
+        )
+        if not bool(torch.all(A @ point <= b + tolerance).item()):
+            raise RuntimeError(
+                f"path node {path_index} is outside assigned corridor "
+                f"{corridor_index}"
+            )
+
+    if np.any(np.diff(path_to_corridor) < 0):
+        raise RuntimeError("path-to-corridor mapping must be monotone")
+    return CorridorResult(
+        corridors=polygons,
+        path_to_corridor=path_to_corridor,
+        overlaps=overlaps,
+        reference_xy=reference_xy,
+        reference_heading=reference_heading,
+        source_segment_indices=source_indices,
+        diagnostics=diagnostics,
+    )

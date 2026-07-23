@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""B/C/D ablation for Hybrid A*, unconstrained Bezier, and the full corridor pipeline."""
+"""B/C/D ablation for raw Hybrid, corridor Bezier, and curvature collocation."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -16,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.special
 import torch
 
 
@@ -30,6 +28,10 @@ from ground_nav.corridor_2d import (  # noqa: E402
     PlanarCollisionSet,
     build_planar_corridor,
     compute_stopping_distance,
+)
+from ground_nav.curvature_trajectory_optimizer import (  # noqa: E402
+    CurvatureTrajectoryOptimizer,
+    TrajectoryOptimizerConfig,
 )
 from ground_nav.ground_grid import GroundGrid  # noqa: E402
 from ground_nav.hybrid_astar import (  # noqa: E402
@@ -52,7 +54,11 @@ from smoke_splatplan import SCENE_PRESETS  # noqa: E402
 from splat.splat_utils import GSplatLoader  # noqa: E402
 
 
-GROUPS = ("B_hybrid_raw", "C_plain_bezier", "D_full_corridor")
+GROUPS = (
+    "B_hybrid_raw",
+    "C_corridor_bezier",
+    "D_curvature_optimizer",
+)
 
 
 def wrapped_differences(values: np.ndarray) -> np.ndarray:
@@ -67,98 +73,6 @@ def flatten_sections(sections: np.ndarray) -> np.ndarray:
     parts = [sections[0]]
     parts.extend(section[1:] for section in sections[1:])
     return np.concatenate(parts, axis=0)
-
-
-def arclength_anchors(
-    poses: np.ndarray,
-    scale: float,
-    spacing_m: float,
-) -> np.ndarray:
-    """Interpolate XY anchors at uniform arclength while preserving endpoints."""
-
-    poses = np.asarray(poses, dtype=np.float64)
-    steps = np.linalg.norm(np.diff(poses[:, :2], axis=0), axis=1)
-    cumulative = np.concatenate([[0.0], np.cumsum(steps)])
-    total = float(cumulative[-1])
-    if total <= 1e-12:
-        raise ValueError("Hybrid A* path has zero length")
-    spacing_scene = float(spacing_m) * float(scale)
-    targets = np.arange(0.0, total, spacing_scene, dtype=np.float64)
-    if len(targets) == 0 or not np.isclose(targets[-1], total):
-        targets = np.concatenate([targets, [total]])
-    anchors = np.column_stack(
-        [np.interp(targets, cumulative, poses[:, axis]) for axis in (0, 1)]
-    )
-    anchors[0] = poses[0, :2]
-    anchors[-1] = poses[-1, :2]
-    keep = np.concatenate(
-        [[True], np.linalg.norm(np.diff(anchors, axis=0), axis=1) > 1e-12]
-    )
-    anchors = anchors[keep]
-    if len(anchors) < 2:
-        raise ValueError("ordinary Bezier requires two distinct anchors")
-    return anchors
-
-
-def fit_plain_piecewise_bezier(
-    poses: np.ndarray,
-    scale: float,
-    spacing_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fit an obstacle-unaware C1 piecewise cubic Bezier through path anchors."""
-
-    anchors = arclength_anchors(poses, scale, spacing_m)
-    intervals = np.linalg.norm(np.diff(anchors, axis=0), axis=1)
-    parameters = np.concatenate([[0.0], np.cumsum(intervals)])
-    derivatives = np.zeros_like(anchors)
-    derivatives[0] = [math.cos(poses[0, 2]), math.sin(poses[0, 2])]
-    derivatives[-1] = [math.cos(poses[-1, 2]), math.sin(poses[-1, 2])]
-    for index in range(1, len(anchors) - 1):
-        previous_interval = parameters[index] - parameters[index - 1]
-        next_interval = parameters[index + 1] - parameters[index]
-        previous_slope = (
-            anchors[index] - anchors[index - 1]
-        ) / previous_interval
-        next_slope = (
-            anchors[index + 1] - anchors[index]
-        ) / next_interval
-        derivatives[index] = (
-            next_interval * previous_slope
-            + previous_interval * next_slope
-        ) / (previous_interval + next_interval)
-
-    controls = []
-    for index, interval in enumerate(intervals):
-        controls.append(
-            np.stack(
-                [
-                    anchors[index],
-                    anchors[index] + interval * derivatives[index] / 3.0,
-                    anchors[index + 1]
-                    - interval * derivatives[index + 1] / 3.0,
-                    anchors[index + 1],
-                ],
-                axis=1,
-            )
-        )
-    return np.asarray(controls, dtype=np.float64), anchors
-
-
-def sample_bezier_controls(
-    controls: np.ndarray,
-    samples_per_section: int,
-) -> np.ndarray:
-    degree = controls.shape[-1] - 1
-    values = np.linspace(0.0, 1.0, samples_per_section)
-    basis = np.stack(
-        [
-            scipy.special.comb(degree, index)
-            * (1.0 - values) ** (degree - index)
-            * values**index
-            for index in range(degree + 1)
-        ]
-    )
-    return np.stack([(control @ basis).T for control in controls])
 
 
 def continuous_collision_statistics(
@@ -209,7 +123,15 @@ def free_space_statistics(points: np.ndarray, grid: GroundGrid) -> dict:
     }
 
 
-def raw_record(trial: dict, hybrid_path, scale: float, search_time: float) -> dict:
+def raw_record(
+    trial: dict,
+    hybrid_path,
+    grid: GroundGrid,
+    collision_set: PlanarCollisionSet,
+    scale: float,
+    search_time: float,
+    min_turning_radius_m: float,
+) -> dict:
     signed_curvatures = hybrid_path.primitive_curvatures_1pm
     curvatures = np.abs(signed_curvatures)
     curvature_changes = (
@@ -217,12 +139,15 @@ def raw_record(trial: dict, hybrid_path, scale: float, search_time: float) -> di
         if len(curvatures) > 1
         else 0
     )
-    return {
+    record = {
         "trial_id": trial["trial_id"],
         "candidate_id": trial["candidate_id"],
         "distance_layer": trial["distance_layer"],
         "group": "B_hybrid_raw",
-        "success": True,
+        "search_success": True,
+        "corridor_success": None,
+        "optimization_success": None,
+        "tracking_success": None,
         "path_length_m": path_length_m(hybrid_path.xy, scale),
         "pose_count": int(len(hybrid_path.poses_scene)),
         "primitive_count": int(len(hybrid_path.primitive_curvatures_1pm)),
@@ -238,60 +163,24 @@ def raw_record(trial: dict, hybrid_path, scale: float, search_time: float) -> di
         ),
         "time_hybrid_astar_s": float(search_time),
     }
+    record.update(continuous_collision_statistics(hybrid_path.xy, collision_set))
+    record.update(free_space_statistics(hybrid_path.xy, grid))
+    record["continuous_safe"] = bool(record["collision_free"])
+    record["grid_safe"] = bool(record["outside_free_sample_count"] == 0)
+    record["curvature_feasible"] = bool(
+        record["max_abs_curvature_1pm"]
+        <= 1.0 / float(min_turning_radius_m) + 1e-9
+    )
+    record["curvature_rate_feasible"] = False
+    record["success"] = bool(
+        record["continuous_safe"]
+        and record["grid_safe"]
+        and record["curvature_feasible"]
+    )
+    return record
 
 
-def plain_bezier_record(
-    trial: dict,
-    hybrid_path,
-    grid: GroundGrid,
-    collision_set: PlanarCollisionSet,
-    scale: float,
-    spacing_m: float,
-    samples_per_section: int,
-) -> tuple[dict, dict | None]:
-    record = {
-        "trial_id": trial["trial_id"],
-        "candidate_id": trial["candidate_id"],
-        "distance_layer": trial["distance_layer"],
-        "group": "C_plain_bezier",
-        "success": False,
-        "failure_stage": None,
-        "failure_reason": None,
-    }
-    try:
-        begin = time.perf_counter()
-        controls, anchors = fit_plain_piecewise_bezier(
-            hybrid_path.poses_scene,
-            scale,
-            spacing_m,
-        )
-        dense = sample_bezier_controls(controls, samples_per_section)
-        flat = flatten_sections(dense)
-        record["time_bezier_s"] = time.perf_counter() - begin
-        record["anchor_count"] = int(len(anchors))
-        record["section_count"] = int(len(controls))
-        record.update(trajectory_quality(controls, dense, scale))
-        record["path_length_m"] = record["bezier_length_m"]
-        record["path_length_ratio_to_hybrid"] = float(
-            record["path_length_m"] / path_length_m(hybrid_path.xy, scale)
-        )
-        begin = time.perf_counter()
-        record.update(continuous_collision_statistics(flat, collision_set))
-        record["time_collision_check_s"] = time.perf_counter() - begin
-        record.update(free_space_statistics(flat, grid))
-        record["success"] = True
-        return record, {
-            "hybrid": hybrid_path.xy,
-            "anchors": anchors,
-            "curve": flat,
-        }
-    except Exception as error:
-        record["failure_stage"] = "plain_bezier"
-        record["failure_reason"] = str(error)
-        return record, None
-
-
-def full_corridor_record(
+def corridor_bezier_record(
     trial: dict,
     hybrid_path,
     grid: GroundGrid,
@@ -305,10 +194,16 @@ def full_corridor_record(
         "trial_id": trial["trial_id"],
         "candidate_id": trial["candidate_id"],
         "distance_layer": trial["distance_layer"],
-        "group": "D_full_corridor",
+        "group": "C_corridor_bezier",
+        "search_success": True,
+        "corridor_success": False,
         "success": False,
         "optimization_success": False,
+        "grid_safe": False,
+        "continuous_safe": False,
         "curvature_feasible": False,
+        "curvature_rate_feasible": False,
+        "tracking_success": None,
         "failure_stage": None,
         "failure_reason": None,
     }
@@ -317,10 +212,12 @@ def full_corridor_record(
     try:
         sync(device)
         begin = time.perf_counter()
-        corridor = build_planar_corridor(seed, collision_set)
+        corridor = build_planar_corridor(hybrid_path.poses_scene, collision_set)
         sync(device)
         record["time_corridor_s"] = time.perf_counter() - begin
         record["polygon_count"] = int(len(corridor.polygons))
+        record["corridor_success"] = True
+        record["overlap_count"] = int(len(corridor.overlaps))
         created = [
             row for row in corridor.diagnostics if row.get("created_polygon")
         ]
@@ -339,7 +236,7 @@ def full_corridor_record(
             seed[0],
             seed[-1],
             start_yaw=float(hybrid_path.poses_scene[0, 2]),
-            goal_yaw=float(hybrid_path.poses_scene[-1, 2]),
+            goal_yaw=None,
             endpoint_tangent_min=(
                 0.25 * float(torch.min(grid.cell_sizes).item())
             ),
@@ -380,10 +277,213 @@ def full_corridor_record(
             record["failure_reason"] = (
                 "Bezier curvature exceeds forward Hybrid A* limit"
             )
-        record["success"] = bool(record["curvature_feasible"])
+        flat = flatten_sections(dense)
+        record.update(continuous_collision_statistics(flat, collision_set))
+        record.update(free_space_statistics(flat, grid))
+        record["continuous_safe"] = bool(record["collision_free"])
+        record["grid_safe"] = bool(record["outside_free_sample_count"] == 0)
+        record["success"] = bool(
+            record["optimization_success"]
+            and record["grid_safe"]
+            and record["continuous_safe"]
+            and record["curvature_feasible"]
+        )
         return record, {
             "hybrid": seed,
-            "curve": flatten_sections(dense),
+            "curve": flat,
+        }
+    except Exception as error:
+        record["failure_stage"] = stage
+        record["failure_reason"] = str(error)
+        return record, None
+
+
+def curvature_optimizer_record(
+    trial: dict,
+    hybrid_path,
+    grid: GroundGrid,
+    collision_set: PlanarCollisionSet,
+    scale: float,
+    min_turning_radius_m: float,
+    max_curvature_rate_1pm2: float,
+    optimizer_nodes: int,
+    optimizer_max_iterations: int,
+    optimizer_max_refinements: int,
+    device: torch.device,
+) -> tuple[dict, dict | None]:
+    record = {
+        "trial_id": trial["trial_id"],
+        "candidate_id": trial["candidate_id"],
+        "distance_layer": trial["distance_layer"],
+        "group": "D_curvature_optimizer",
+        "search_success": True,
+        "corridor_success": False,
+        "optimization_success": False,
+        "grid_safe": False,
+        "continuous_safe": False,
+        "curvature_feasible": False,
+        "curvature_rate_feasible": False,
+        "tracking_success": None,
+        "fallback_used": False,
+        "success": False,
+        "failure_stage": None,
+        "failure_reason": None,
+    }
+    stage = "corridor"
+    try:
+        sync(device)
+        begin = time.perf_counter()
+        corridor = build_planar_corridor(
+            hybrid_path.poses_scene,
+            collision_set,
+        )
+        sync(device)
+        record["time_corridor_s"] = time.perf_counter() - begin
+        record["corridor_success"] = True
+        record["polygon_count"] = int(len(corridor.corridors))
+        record["overlap_count"] = int(len(corridor.overlaps))
+
+        stage = "curvature_optimizer"
+        reference_m = np.asarray(hybrid_path.poses_scene, dtype=np.float64).copy()
+        reference_m[:, :2] /= scale
+        corridors_m = [
+            (
+                np.asarray(A.detach().cpu(), dtype=np.float64),
+                np.asarray(b.detach().cpu(), dtype=np.float64) / scale,
+            )
+            for A, b in corridor.corridors
+        ]
+        optimizer = CurvatureTrajectoryOptimizer(
+            TrajectoryOptimizerConfig(
+                node_count=optimizer_nodes,
+                max_iterations=optimizer_max_iterations,
+                max_refinement_steps=optimizer_max_refinements,
+            )
+        )
+        print(
+            json.dumps(
+                {
+                    "trial_id": trial["trial_id"],
+                    "stage": "curvature_optimizer",
+                    "reference_pose_count": int(len(reference_m)),
+                    "corridor_count": int(len(corridor.corridors)),
+                    "requested_nodes": int(optimizer_nodes),
+                    "max_iterations": int(optimizer_max_iterations),
+                    "max_refinements": int(optimizer_max_refinements),
+                }
+            ),
+            flush=True,
+        )
+        trajectory = optimizer.optimize(
+            reference_m,
+            corridors_m,
+            corridor.path_to_corridor,
+            start_pose=reference_m[0],
+            goal_xy=reference_m[-1, :2],
+            min_turning_radius=min_turning_radius_m,
+            max_curvature_rate=max_curvature_rate_1pm2,
+        )
+        record["time_optimizer_s"] = trajectory.solve_time
+        record["optimizer_attempt_count"] = len(trajectory.diagnostics)
+        print(
+            json.dumps(
+                {
+                    "trial_id": trial["trial_id"],
+                    "stage": "curvature_optimizer_done",
+                    "success": trajectory.success,
+                    "solve_time_s": trajectory.solve_time,
+                    "attempt_count": len(trajectory.diagnostics),
+                    "failure_reason": trajectory.failure_reason,
+                }
+            ),
+            flush=True,
+        )
+        if trajectory.diagnostics:
+            record["optimizer_status"] = trajectory.diagnostics[-1][
+                "solver_message"
+            ]
+            record["max_dynamics_error"] = trajectory.diagnostics[-1][
+                "max_dense_dynamics_error"
+            ]
+            record["min_corridor_margin_m"] = trajectory.diagnostics[-1][
+                "minimum_dense_corridor_margin"
+            ]
+            record["applied_curvature_rate_limit_1pm2"] = trajectory.diagnostics[
+                -1
+            ]["curvature_rate_limit"]
+        if not trajectory.success:
+            raw_continuous = continuous_collision_statistics(
+                hybrid_path.xy, collision_set
+            )
+            raw_grid = free_space_statistics(hybrid_path.xy, grid)
+            raw_curvature_ok = bool(
+                np.max(np.abs(hybrid_path.primitive_curvatures_1pm))
+                <= 1.0 / min_turning_radius_m + 1e-9
+            )
+            record.update(raw_continuous)
+            record.update(raw_grid)
+            record["continuous_safe"] = bool(raw_continuous["collision_free"])
+            record["grid_safe"] = bool(
+                raw_grid["outside_free_sample_count"] == 0
+            )
+            record["curvature_feasible"] = raw_curvature_ok
+            record["fallback_used"] = bool(
+                record["continuous_safe"]
+                and record["grid_safe"]
+                and raw_curvature_ok
+            )
+            record["failure_stage"] = stage
+            record["failure_reason"] = trajectory.failure_reason
+            return record, {
+                "hybrid": hybrid_path.xy,
+                "curve": hybrid_path.xy,
+                "fallback": True,
+            }
+
+        record["optimization_success"] = True
+        dense_scene = np.asarray(trajectory.dense_poses, dtype=np.float64).copy()
+        dense_scene[:, :2] *= scale
+        record["path_length_m"] = float(trajectory.arc_length[-1])
+        record["path_length_ratio_to_hybrid"] = float(
+            record["path_length_m"] / path_length_m(hybrid_path.xy, scale)
+        )
+        record["max_abs_curvature_1pm"] = float(
+            np.max(np.abs(trajectory.curvature))
+        )
+        record["max_abs_curvature_rate_1pm2"] = float(
+            np.max(np.abs(trajectory.curvature_rate))
+        )
+        curvature_limit = 0.95 / min_turning_radius_m
+        applied_rate_limit = float(
+            trajectory.diagnostics[-1]["curvature_rate_limit"]
+        )
+        record["curvature_limit_1pm"] = curvature_limit
+        record["curvature_feasible"] = bool(
+            record["max_abs_curvature_1pm"] <= curvature_limit + 1e-6
+        )
+        record["curvature_rate_feasible"] = bool(
+            record["max_abs_curvature_rate_1pm2"]
+            <= applied_rate_limit + 1e-6
+        )
+        record.update(
+            continuous_collision_statistics(dense_scene[:, :2], collision_set)
+        )
+        record.update(free_space_statistics(dense_scene[:, :2], grid))
+        record["continuous_safe"] = bool(record["collision_free"])
+        record["grid_safe"] = bool(record["outside_free_sample_count"] == 0)
+        record["success"] = bool(
+            record["optimization_success"]
+            and record["grid_safe"]
+            and record["continuous_safe"]
+            and record["curvature_feasible"]
+            and record["curvature_rate_feasible"]
+        )
+        if not record["success"]:
+            record["failure_stage"] = "verification"
+            record["failure_reason"] = "optimized trajectory failed final checks"
+        return record, {
+            "hybrid": hybrid_path.xy,
+            "curve": dense_scene[:, :2],
         }
     except Exception as error:
         record["failure_stage"] = stage
@@ -424,6 +524,7 @@ def summary_for_records(
         "time_corridor_s",
         "time_qp_s",
         "time_downstream_s",
+        "time_optimizer_s",
         "pose_count",
         "primitive_count",
         "anchor_count",
@@ -432,6 +533,8 @@ def summary_for_records(
         "outside_free_sample_fraction",
         "continuous_unsafe_segment_fraction",
         "path_length_ratio_to_hybrid",
+        "max_abs_curvature_rate_1pm2",
+        "min_corridor_margin_m",
     )
     result = {
         "sample_count": int(sample_count),
@@ -454,7 +557,11 @@ def summary_for_records(
     }
     for group in GROUPS:
         rows = [row for row in records if row["group"] == group]
-        generated = [row for row in rows if row.get("optimization_success", row["success"])]
+        generated = [
+            row
+            for row in rows
+            if group == "B_hybrid_raw" or row.get("optimization_success", False)
+        ]
         metric_rows = [
             {**row, "success": True}
             for row in generated
@@ -466,43 +573,35 @@ def summary_for_records(
                 sum(row["success"] for row in rows) / sample_count
             ),
             "generated_count": int(len(generated)),
+            "search_success_count": int(
+                sum(row.get("search_success", False) for row in rows)
+            ),
+            "corridor_success_count": int(
+                sum(row.get("corridor_success") is True for row in rows)
+            ),
+            "optimization_success_count": int(
+                sum(row.get("optimization_success") is True for row in rows)
+            ),
+            "grid_safe_count": int(
+                sum(row.get("grid_safe", False) for row in rows)
+            ),
+            "continuous_safe_count": int(
+                sum(row.get("continuous_safe", False) for row in rows)
+            ),
+            "curvature_feasible_count": int(
+                sum(row.get("curvature_feasible", False) for row in rows)
+            ),
+            "curvature_rate_feasible_count": int(
+                sum(row.get("curvature_rate_feasible", False) for row in rows)
+            ),
+            "tracking_success_count": int(
+                sum(row.get("tracking_success") is True for row in rows)
+            ),
+            "fallback_count": int(
+                sum(row.get("fallback_used", False) for row in rows)
+            ),
             "metrics": {key: numeric_summary(metric_rows, key) for key in metrics},
         }
-        if group == "C_plain_bezier":
-            entry.update(
-                {
-                    "collision_free_count": int(
-                        sum(row.get("collision_free", False) for row in rows)
-                    ),
-                    "collision_trial_count": int(
-                        sum(
-                            row["success"] and not row.get("collision_free", False)
-                            for row in rows
-                        )
-                    ),
-                    "collision_trial_rate": float(
-                        sum(
-                            row["success"] and not row.get("collision_free", False)
-                            for row in rows
-                        )
-                        / sample_count
-                    ),
-                    "outside_free_trial_count": int(
-                        sum(row.get("outside_free_sample_count", 0) > 0 for row in rows)
-                    ),
-                }
-            )
-        if group == "D_full_corridor":
-            entry.update(
-                {
-                    "optimization_success_count": int(
-                        sum(row.get("optimization_success", False) for row in rows)
-                    ),
-                    "curvature_feasible_count": int(
-                        sum(row.get("curvature_feasible", False) for row in rows)
-                    ),
-                }
-            )
         result["results"][group] = entry
     return result
 
@@ -550,22 +649,21 @@ def plot_representatives(
                     linewidth=1.0,
                     label="Hybrid A*",
                 )
-                if group == "C_plain_bezier":
-                    axis.plot(
-                        artifact["anchors"][:, 0],
-                        artifact["anchors"][:, 1],
-                        "o",
-                        color="tab:orange",
-                        markersize=2.5,
-                        label="anchors",
-                    )
                 if "curve" in artifact:
                     axis.plot(
                         artifact["curve"][:, 0],
                         artifact["curve"][:, 1],
                         color="tab:red",
                         linewidth=1.5,
-                        label="Bezier",
+                        label=(
+                            "Hybrid fallback"
+                            if artifact.get("fallback", False)
+                            else (
+                                "Bezier"
+                                if group == "C_corridor_bezier"
+                                else "Curvature trajectory"
+                            )
+                        ),
                     )
                 axis.legend(fontsize=7)
             configure_map_axis(axis, extent, f"{layer} / {group}")
@@ -589,9 +687,11 @@ def main() -> None:
     parser.add_argument("--min-turning-radius-meters", type=float, default=0.20)
     parser.add_argument("--hybrid-heading-bins", type=int, default=72)
     parser.add_argument("--hybrid-max-expansions", type=int, default=200000)
-    parser.add_argument("--plain-bezier-anchor-spacing-meters", type=float, default=0.50)
-    parser.add_argument("--plain-bezier-samples-per-section", type=int, default=50)
     parser.add_argument("--corridor-bezier-samples-per-section", type=int, default=100)
+    parser.add_argument("--max-curvature-rate-1pm2", type=float, default=10.0)
+    parser.add_argument("--trajectory-optimizer-nodes", type=int, default=32)
+    parser.add_argument("--trajectory-optimizer-max-iterations", type=int, default=500)
+    parser.add_argument("--trajectory-optimizer-max-refinements", type=int, default=2)
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -685,6 +785,7 @@ def main() -> None:
             "goal_heading_mode": "free",
             "requested_goal_yaw_rad": None,
             "success": False,
+            "search_success": False,
             "failure_reason": None,
         }
         hybrid_path = None
@@ -697,6 +798,7 @@ def main() -> None:
             search_record["time_hybrid_astar_s"] = time.perf_counter() - begin
             search_record.update(hybrid_path.summary())
             search_record["success"] = True
+            search_record["search_success"] = True
         except Exception as error:
             search_record["failure_reason"] = str(error)
         search_records.append(search_record)
@@ -708,19 +810,13 @@ def main() -> None:
         b_record = raw_record(
             trial,
             hybrid_path,
-            scale,
-            search_record["time_hybrid_astar_s"],
-        )
-        c_record, c_artifact = plain_bezier_record(
-            trial,
-            hybrid_path,
             grid,
             collision_set,
             scale,
-            args.plain_bezier_anchor_spacing_meters,
-            args.plain_bezier_samples_per_section,
+            search_record["time_hybrid_astar_s"],
+            args.min_turning_radius_meters,
         )
-        d_record, d_artifact = full_corridor_record(
+        c_record, c_artifact = corridor_bezier_record(
             trial,
             hybrid_path,
             grid,
@@ -728,6 +824,19 @@ def main() -> None:
             scale,
             args.min_turning_radius_meters,
             args.corridor_bezier_samples_per_section,
+            device,
+        )
+        d_record, d_artifact = curvature_optimizer_record(
+            trial,
+            hybrid_path,
+            grid,
+            collision_set,
+            scale,
+            args.min_turning_radius_meters,
+            args.max_curvature_rate_1pm2,
+            args.trajectory_optimizer_nodes,
+            args.trajectory_optimizer_max_iterations,
+            args.trajectory_optimizer_max_refinements,
             device,
         )
         trial_records = (b_record, c_record, d_record)
@@ -739,9 +848,9 @@ def main() -> None:
                 "hybrid": hybrid_path.xy,
             }
             if c_artifact is not None:
-                artifacts[(trial["trial_id"], "C_plain_bezier")] = c_artifact
+                artifacts[(trial["trial_id"], "C_corridor_bezier")] = c_artifact
             if d_artifact is not None:
-                artifacts[(trial["trial_id"], "D_full_corridor")] = d_artifact
+                artifacts[(trial["trial_id"], "D_curvature_optimizer")] = d_artifact
         print(
             json.dumps(
                 {
@@ -752,6 +861,9 @@ def main() -> None:
                     "D_optimized": d_record.get("optimization_success"),
                     "D_curvature_feasible": d_record.get("curvature_feasible"),
                     "D_max_curvature": d_record.get("max_abs_curvature_1pm"),
+                    "D_max_curvature_rate": d_record.get(
+                        "max_abs_curvature_rate_1pm2"
+                    ),
                 }
             ),
             flush=True,
@@ -770,17 +882,25 @@ def main() -> None:
                 "distance_layers": ["near", "medium", "far"],
                 "trials_per_layer": args.sample_count // 3,
                 "goal_heading_mode": "free",
-                "plain_bezier": {
-                    "type": "chord-length C1 piecewise cubic Bezier",
-                    "anchor_spacing_m": args.plain_bezier_anchor_spacing_meters,
-                    "samples_per_section": args.plain_bezier_samples_per_section,
-                    "obstacle_constraints": False,
+                "corridor_bezier": {
+                    "type": "degree-6 Bezier QP in ordered GS corridors",
+                    "samples_per_section": args.corridor_bezier_samples_per_section,
+                    "start_heading": "fixed",
+                    "terminal_heading": "free",
                 },
                 "full_method": (
-                    "Hybrid A* -> GS safety corridor -> degree-6 Bezier QP "
-                    "-> max-curvature feasibility check"
+                    "Hybrid A* -> ordered GS safety corridor -> arc-length "
+                    "direct collocation with curvature and curvature-rate constraints"
                 ),
-                "curvature_limit_1pm": 1.0 / args.min_turning_radius_meters,
+                "curvature_limit_1pm": 0.95 / args.min_turning_radius_meters,
+                "max_curvature_rate_1pm2": args.max_curvature_rate_1pm2,
+                "trajectory_optimizer_nodes": args.trajectory_optimizer_nodes,
+                "trajectory_optimizer_max_iterations": (
+                    args.trajectory_optimizer_max_iterations
+                ),
+                "trajectory_optimizer_max_refinements": (
+                    args.trajectory_optimizer_max_refinements
+                ),
             },
         }
     )

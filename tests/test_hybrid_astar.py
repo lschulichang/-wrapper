@@ -65,6 +65,10 @@ class HybridAStarTest(unittest.TestCase):
         np.testing.assert_allclose(result.poses_scene[-1], [12.5, 2.5, 0.0], atol=1e-9)
         self.assertTrue(result.analytic_expansion_used)
         self.assertTrue(np.allclose(result.poses_scene[:, 1], 2.5, atol=1e-8))
+        self.assertEqual(len(result.arc_lengths_m), len(result.poses_scene))
+        self.assertAlmostEqual(result.arc_lengths_m[0], 0.0)
+        self.assertAlmostEqual(result.arc_lengths_m[-1], 10.0)
+        self.assertTrue(np.all(np.diff(result.arc_lengths_m) > 0.0))
 
     def test_quarter_turn_respects_minimum_radius(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
@@ -176,7 +180,14 @@ class HybridAStarTest(unittest.TestCase):
             radius=0.25,
             stopping_distance=2.0,
         )
-        corridor = build_planar_corridor(result.xy, collision_set)
+        corridor = build_planar_corridor(result.poses_scene, collision_set)
+        self.assertEqual(len(corridor.path_to_corridor), len(result.poses_scene))
+        self.assertTrue(np.all(np.diff(corridor.path_to_corridor) >= 0))
+        np.testing.assert_allclose(
+            corridor.reference_heading,
+            result.poses_scene[:, 2],
+        )
+        self.assertTrue(all(row["valid"] for row in corridor.overlaps))
         bezier = BezierPlanner2D(degree=6, continuity_order=3)
         controls, feasible = bezier.optimize(
             corridor.polygons,

@@ -91,6 +91,7 @@ class HybridPath:
     """Dense path samples plus compact search diagnostics."""
 
     poses_scene: np.ndarray
+    arc_lengths_m: np.ndarray
     node_poses_scene: np.ndarray
     primitive_curvatures_1pm: np.ndarray
     total_cost_m: float
@@ -105,15 +106,15 @@ class HybridPath:
         return self.poses_scene[:, :2]
 
     def summary(self) -> dict:
-        lengths = np.linalg.norm(np.diff(self.poses_scene[:, :2], axis=0), axis=1)
-        scene_scale = float(self.config["scene_scale"])
         return {
             "backend": "hybrid_astar_forward_dubins",
             "dense_pose_count": int(len(self.poses_scene)),
             "search_node_pose_count": int(len(self.node_poses_scene)),
             "primitive_count": int(len(self.primitive_curvatures_1pm)),
-            "path_length_scene": float(lengths.sum()),
-            "path_length_m": float(lengths.sum() / scene_scale),
+            "path_length_scene": float(
+                self.arc_lengths_m[-1] * float(self.config["scene_scale"])
+            ),
+            "path_length_m": float(self.arc_lengths_m[-1]),
             "total_cost_m": float(self.total_cost_m),
             "expanded_nodes": int(self.expanded_nodes),
             "generated_nodes": int(self.generated_nodes),
@@ -578,8 +579,14 @@ class HybridAStarPlanner:
             raise RuntimeError(
                 "validated Hybrid A* reconstruction contains an occupied sample"
             )
+        segment_lengths_m = (
+            np.linalg.norm(np.diff(dense_array[:, :2], axis=0), axis=1)
+            / self.scene_scale
+        )
+        arc_lengths_m = np.concatenate([[0.0], np.cumsum(segment_lengths_m)])
         return HybridPath(
             poses_scene=dense_array,
+            arc_lengths_m=arc_lengths_m,
             node_poses_scene=np.vstack([node_poses, analytic_poses[-1]]),
             primitive_curvatures_1pm=np.asarray(
                 primitive_curvatures_m, dtype=np.float64
