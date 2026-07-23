@@ -19,6 +19,10 @@ from .hybrid_astar import (
     Pose2D,
 )
 from .planar_gaussians import PlanarGaussianSet
+from .primitive_path_simplifier import (
+    PrimitivePathSimplification,
+    simplify_hybrid_path_by_primitives,
+)
 from .three_layer_planner import (
     ThreeLayerGroundPlanner,
     ThreeLayerPlannerConfig,
@@ -40,6 +44,8 @@ __all__ = [
     "HybridPath",
     "Pose2D",
     "PlanarGaussianSet",
+    "PrimitivePathSimplification",
+    "simplify_hybrid_path_by_primitives",
     "ThreeLayerGroundPlanner",
     "ThreeLayerPlannerConfig",
     "ThreeLayerPlanResult",

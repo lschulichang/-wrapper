@@ -162,7 +162,12 @@ class HybridAStarTest(unittest.TestCase):
         result = planner._reconstruct(
             records,
             2,
-            (np.asarray([second_edge[-1]]), np.empty(0), 0.0),
+            (
+                np.asarray([second_edge[-1]]),
+                np.empty(0),
+                np.asarray([second_edge[-1]]),
+                0.0,
+            ),
             expanded_nodes=3,
             generated_nodes=4,
             goal_heading_constrained=False,
@@ -170,6 +175,10 @@ class HybridAStarTest(unittest.TestCase):
         expected = np.vstack([start, first_edge, second_edge])
         np.testing.assert_allclose(result.poses_scene, expected, atol=1e-12)
         self.assertFalse(np.any(np.isclose(result.poses_scene[:, 1], 3.5)))
+        np.testing.assert_allclose(
+            result.primitive_boundary_poses_scene,
+            [start, first_edge[-1], second_edge[-1]],
+        )
 
     def test_dense_hybrid_seed_has_ordered_corridor_mapping(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())

@@ -90,9 +90,16 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
         self.assertTrue(result.curvature_feasible)
         self.assertTrue(result.curvature_rate_feasible)
         self.assertFalse(result.fallback_used)
+        self.assertIsNotNone(result.simplification)
         self.assertEqual(
             len(result.corridor.path_to_corridor),
-            len(result.hybrid_path.poses_scene),
+            len(result.simplification.merged_poses_scene),
+        )
+        self.assertLessEqual(
+            len(result.simplification.merged_poses_scene),
+            len(
+                result.hybrid_path.primitive_boundary_poses_scene
+            ),
         )
         self.assertGreater(len(result.dense_output_poses_scene), 2)
 

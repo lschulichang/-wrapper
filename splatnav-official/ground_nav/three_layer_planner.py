@@ -15,6 +15,10 @@ from .curvature_trajectory_optimizer import (
     TrajectoryResult,
 )
 from .hybrid_astar import HybridPath
+from .primitive_path_simplifier import (
+    PrimitivePathSimplification,
+    simplify_hybrid_path_by_primitives,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,7 @@ class ThreeLayerPlanResult:
     failure_stage: str | None
     failure_reason: str | None
     hybrid_path: HybridPath | None
+    simplification: PrimitivePathSimplification | None
     corridor: CorridorResult | None
     trajectory_m: TrajectoryResult | None
     output_poses_scene: np.ndarray
@@ -114,6 +119,7 @@ class ThreeLayerGroundPlanner:
     ) -> ThreeLayerPlanResult:
         timings: dict[str, float] = {}
         hybrid_path = None
+        simplification = None
         corridor = None
         trajectory = None
         stage = "hybrid_astar"
@@ -126,10 +132,19 @@ class ThreeLayerGroundPlanner:
                 time.perf_counter() - begin
             )
 
+            stage = "primitive_simplification"
+            begin = time.perf_counter()
+            simplification = simplify_hybrid_path_by_primitives(
+                hybrid_path
+            )
+            timings["primitive_simplification_s"] = (
+                time.perf_counter() - begin
+            )
+
             stage = "ordered_corridor"
             begin = time.perf_counter()
             corridor = build_planar_corridor(
-                hybrid_path.poses_scene,
+                simplification.merged_poses_scene,
                 self.collision_set,
             )
             timings["ordered_corridor_s"] = (
@@ -138,7 +153,8 @@ class ThreeLayerGroundPlanner:
 
             stage = "curvature_collocation"
             reference_m = np.asarray(
-                hybrid_path.poses_scene, dtype=np.float64
+                simplification.merged_poses_scene,
+                dtype=np.float64,
             ).copy()
             reference_m[:, :2] /= self.scene_scale
             corridors_m = [
@@ -172,6 +188,7 @@ class ThreeLayerGroundPlanner:
             if not trajectory.success:
                 return self._fallback_result(
                     hybrid_path,
+                    simplification,
                     corridor,
                     trajectory,
                     timings,
@@ -216,6 +233,7 @@ class ThreeLayerGroundPlanner:
             ):
                 return self._fallback_result(
                     hybrid_path,
+                    simplification,
                     corridor,
                     trajectory,
                     timings,
@@ -237,6 +255,7 @@ class ThreeLayerGroundPlanner:
                 failure_stage=None,
                 failure_reason=None,
                 hybrid_path=hybrid_path,
+                simplification=simplification,
                 corridor=corridor,
                 trajectory_m=trajectory,
                 output_poses_scene=output,
@@ -247,6 +266,7 @@ class ThreeLayerGroundPlanner:
             if hybrid_path is not None:
                 return self._fallback_result(
                     hybrid_path,
+                    simplification,
                     corridor,
                     trajectory,
                     timings,
@@ -264,6 +284,7 @@ class ThreeLayerGroundPlanner:
                 failure_stage=stage,
                 failure_reason=str(error),
                 hybrid_path=None,
+                simplification=None,
                 corridor=None,
                 trajectory_m=None,
                 output_poses_scene=np.empty((0, 3)),
@@ -274,6 +295,7 @@ class ThreeLayerGroundPlanner:
     def _fallback_result(
         self,
         hybrid_path,
+        simplification,
         corridor,
         trajectory,
         timings,
@@ -300,6 +322,7 @@ class ThreeLayerGroundPlanner:
                 else str(failure_reason)
             ),
             hybrid_path=hybrid_path,
+            simplification=simplification,
             corridor=corridor,
             trajectory_m=trajectory,
             output_poses_scene=fallback,

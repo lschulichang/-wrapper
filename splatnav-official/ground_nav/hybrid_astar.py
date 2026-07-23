@@ -92,6 +92,7 @@ class HybridPath:
 
     poses_scene: np.ndarray
     arc_lengths_m: np.ndarray
+    primitive_boundary_poses_scene: np.ndarray
     node_poses_scene: np.ndarray
     primitive_curvatures_1pm: np.ndarray
     total_cost_m: float
@@ -109,6 +110,9 @@ class HybridPath:
         return {
             "backend": "hybrid_astar_forward_dubins",
             "dense_pose_count": int(len(self.poses_scene)),
+            "primitive_boundary_pose_count": int(
+                len(self.primitive_boundary_poses_scene)
+            ),
             "search_node_pose_count": int(len(self.node_poses_scene)),
             "primitive_count": int(len(self.primitive_curvatures_1pm)),
             "path_length_scene": float(
@@ -371,9 +375,10 @@ class HybridAStarPlanner:
         normalized_lengths: tuple[float, float, float],
         *,
         collision_check: bool,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         current = np.asarray(start, dtype=np.float64)
         dense = [current.copy()]
+        boundaries = [current.copy()]
         curvatures_m = []
         for path_type, normalized_length in zip(path_types, normalized_lengths):
             distance_scene = float(normalized_length) * self.turning_radius_scene
@@ -395,8 +400,13 @@ class HybridAStarPlanner:
                 return None
             dense.extend(samples)
             current = samples[-1]
+            boundaries.append(current.copy())
             curvatures_m.append(curvature_scene * self.scene_scale)
-        return np.asarray(dense, dtype=np.float64), np.asarray(curvatures_m, dtype=np.float64)
+        return (
+            np.asarray(dense, dtype=np.float64),
+            np.asarray(curvatures_m, dtype=np.float64),
+            np.asarray(boundaries, dtype=np.float64),
+        )
 
     def _dubins_shortest(
         self,
@@ -442,7 +452,7 @@ class HybridAStarPlanner:
 
     def _analytic_expansion(
         self, state: np.ndarray, goal: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, float] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
         solution = self._dubins_shortest(
             state,
             goal,
@@ -456,15 +466,21 @@ class HybridAStarPlanner:
         )
         if integrated is None:
             return None
-        poses, curvatures_m = integrated
+        poses, curvatures_m, boundaries = integrated
         poses[-1] = goal
-        return poses, curvatures_m, total_scene / self.scene_scale
+        boundaries[-1] = goal
+        return (
+            poses,
+            curvatures_m,
+            boundaries,
+            total_scene / self.scene_scale,
+        )
 
     def _analytic_expansion_free_heading(
         self,
         state: np.ndarray,
         goal_xy: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, float] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
         """Connect to an exact goal position while choosing the terminal yaw."""
 
         delta = np.asarray(goal_xy, dtype=np.float64) - state[:2]
@@ -538,7 +554,7 @@ class HybridAStarPlanner:
         self,
         records: list[_Record],
         terminal_record_id: int,
-        analytic: tuple[np.ndarray, np.ndarray, float],
+        analytic: tuple[np.ndarray, np.ndarray, np.ndarray, float],
         expanded_nodes: int,
         generated_nodes: int,
         goal_heading_constrained: bool,
@@ -551,6 +567,7 @@ class HybridAStarPlanner:
         record_ids.reverse()
         node_poses = np.stack([records[item].state for item in record_ids])
         dense = [node_poses[0]]
+        primitive_boundaries = [node_poses[0].copy()]
         primitive_curvatures_m = []
         for parent_record_id, child_record_id in zip(
             record_ids[:-1], record_ids[1:]
@@ -564,12 +581,36 @@ class HybridAStarPlanner:
             if not np.allclose(samples[-1], child.state, atol=1e-12, rtol=0.0):
                 raise RuntimeError("validated Hybrid A* edge endpoint is inconsistent")
             dense.extend(samples)
+            primitive_boundaries.append(child.state.copy())
             primitive_curvatures_m.append(child.curvature_scene * self.scene_scale)
 
-        analytic_poses, analytic_curvatures_m, analytic_cost_m = analytic
+        (
+            analytic_poses,
+            analytic_curvatures_m,
+            analytic_boundaries,
+            analytic_cost_m,
+        ) = analytic
+        if not np.allclose(
+            primitive_boundaries[-1],
+            analytic_boundaries[0],
+            atol=1e-10,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                "analytic expansion does not start at the search-path boundary"
+            )
         if len(analytic_poses) > 1:
             dense.extend(analytic_poses[1:])
+        if len(analytic_boundaries) > 1:
+            primitive_boundaries.extend(analytic_boundaries[1:])
         primitive_curvatures_m.extend(analytic_curvatures_m.tolist())
+        primitive_boundaries_array = np.asarray(
+            primitive_boundaries, dtype=np.float64
+        )
+        if len(primitive_boundaries_array) != len(primitive_curvatures_m) + 1:
+            raise RuntimeError(
+                "primitive boundary count is inconsistent with curvatures"
+            )
         dense_array = np.asarray(dense, dtype=np.float64)
         duplicate = np.linalg.norm(np.diff(dense_array[:, :2], axis=0), axis=1) <= 1e-12
         if np.any(duplicate):
@@ -587,6 +628,7 @@ class HybridAStarPlanner:
         return HybridPath(
             poses_scene=dense_array,
             arc_lengths_m=arc_lengths_m,
+            primitive_boundary_poses_scene=primitive_boundaries_array,
             node_poses_scene=np.vstack([node_poses, analytic_poses[-1]]),
             primitive_curvatures_1pm=np.asarray(
                 primitive_curvatures_m, dtype=np.float64
