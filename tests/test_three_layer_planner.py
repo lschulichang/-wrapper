@@ -57,7 +57,7 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
             config=HybridAStarConfig(
                 min_turning_radius_m=2.0,
                 analytic_expansion_interval=10,
-                analytic_expansion_distance_cells=12.0,
+                analytic_expansion_distance_cells=2.0,
             ),
         )
         collision_set = PlanarCollisionSet(
@@ -81,7 +81,23 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
         )
 
     def test_complete_three_layer_plan_reports_each_stage(self):
-        result = self.build().plan([2.5, 2.5, 0.0], [12.5, 2.5])
+        planner = self.build()
+        analytic_expansion = (
+            planner.hybrid_planner._analytic_expansion_free_heading
+        )
+        attempt_count = 0
+
+        def skip_initial_analytic_expansion(state, goal_xy):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                return None
+            return analytic_expansion(state, goal_xy)
+
+        planner.hybrid_planner._analytic_expansion_free_heading = (
+            skip_initial_analytic_expansion
+        )
+        result = planner.plan([2.5, 2.5, 0.0], [12.5, 2.5])
         self.assertTrue(result.success, result.status())
         self.assertTrue(result.search_success)
         self.assertTrue(result.corridor_success)
@@ -90,9 +106,22 @@ class ThreeLayerGroundPlannerTest(unittest.TestCase):
         self.assertTrue(result.curvature_feasible)
         self.assertTrue(result.curvature_rate_feasible)
         self.assertFalse(result.fallback_used)
+        self.assertEqual(
+            result.trajectory_m.summary()["collocation_method"],
+            "hermite_simpson",
+        )
+        self.assertTrue(
+            result.trajectory_m.diagnostics[-1][
+                "transition_overlap_feasible"
+            ]
+        )
         self.assertIsNotNone(result.simplification)
         self.assertEqual(
             len(result.corridor.path_to_corridor),
+            len(result.simplification.boundary_poses_scene),
+        )
+        self.assertGreater(
+            len(result.simplification.boundary_poses_scene),
             len(result.simplification.merged_poses_scene),
         )
         self.assertLessEqual(

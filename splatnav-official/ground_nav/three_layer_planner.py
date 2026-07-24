@@ -1,4 +1,4 @@
-"""Single ground-planning mainline: Hybrid A*, corridor, collocation."""
+"""Mainline: Hybrid A*, primitive-boundary corridor, collocation."""
 
 from __future__ import annotations
 
@@ -143,8 +143,12 @@ class ThreeLayerGroundPlanner:
 
             stage = "ordered_corridor"
             begin = time.perf_counter()
+            corridor_reference_scene = np.asarray(
+                simplification.boundary_poses_scene,
+                dtype=np.float64,
+            )
             corridor = build_planar_corridor(
-                simplification.merged_poses_scene,
+                corridor_reference_scene,
                 self.collision_set,
             )
             timings["ordered_corridor_s"] = (
@@ -152,10 +156,7 @@ class ThreeLayerGroundPlanner:
             )
 
             stage = "curvature_collocation"
-            reference_m = np.asarray(
-                simplification.merged_poses_scene,
-                dtype=np.float64,
-            ).copy()
+            reference_m = corridor_reference_scene.copy()
             reference_m[:, :2] /= self.scene_scale
             corridors_m = [
                 (

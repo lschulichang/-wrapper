@@ -68,7 +68,7 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
         self.assertTrue(result.diagnostics[-1]["dense_dynamics_feasible"])
         self.assertEqual(
             result.summary()["collocation_method"],
-            "trapezoidal",
+            "hermite_simpson",
         )
 
     def test_curvature_is_continuous_under_rate_control(self):
@@ -96,7 +96,7 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
             atol=3e-5,
         )
 
-    def test_all_trapezoidal_collocation_equations(self):
+    def test_all_hermite_simpson_collocation_equations(self):
         radius = 4.0
         angle = np.linspace(0.0, np.pi / 4.0, 13)
         reference = np.column_stack(
@@ -122,24 +122,41 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
         curvature = result.curvature
         rate = result.curvature_rate
         ds = np.diff(result.arc_length)
-        np.testing.assert_allclose(
-            np.diff(x),
-            0.5 * ds * (np.cos(heading[:-1]) + np.cos(heading[1:])),
-            atol=3e-5,
+        states = np.column_stack(
+            [x, y, heading, curvature]
+        )
+        derivatives = np.column_stack(
+            [
+                np.cos(heading),
+                np.sin(heading),
+                curvature,
+                rate,
+            ]
+        )
+        midpoint_states = (
+            0.5 * (states[:-1] + states[1:])
+            + ds[:, None]
+            * (derivatives[:-1] - derivatives[1:])
+            / 8.0
+        )
+        midpoint_rate = 0.5 * (rate[:-1] + rate[1:])
+        midpoint_derivatives = np.column_stack(
+            [
+                np.cos(midpoint_states[:, 2]),
+                np.sin(midpoint_states[:, 2]),
+                midpoint_states[:, 3],
+                midpoint_rate,
+            ]
         )
         np.testing.assert_allclose(
-            np.diff(y),
-            0.5 * ds * (np.sin(heading[:-1]) + np.sin(heading[1:])),
-            atol=3e-5,
-        )
-        np.testing.assert_allclose(
-            np.diff(heading),
-            0.5 * ds * (curvature[:-1] + curvature[1:]),
-            atol=3e-5,
-        )
-        np.testing.assert_allclose(
-            np.diff(curvature),
-            0.5 * ds * (rate[:-1] + rate[1:]),
+            states[1:] - states[:-1],
+            ds[:, None]
+            * (
+                derivatives[:-1]
+                + 4.0 * midpoint_derivatives
+                + derivatives[1:]
+            )
+            / 6.0,
             atol=3e-5,
         )
 
@@ -184,6 +201,48 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
                 min_turning_radius=1.0,
                 max_curvature_rate=0.5,
             )
+
+    def test_transition_node_lies_in_both_adjacent_corridors(self):
+        x = np.linspace(0.0, 5.0, 11)
+        reference = np.column_stack(
+            [x, np.zeros_like(x), np.zeros_like(x)]
+        )
+        left = rectangular_corridor(-0.5, 2.7, -1.0, 1.0)
+        right = rectangular_corridor(2.3, 5.5, -1.0, 1.0)
+        mapping = np.zeros(len(reference), dtype=int)
+        mapping[x >= 2.5] = 1
+        result = self.optimizer().optimize(
+            reference,
+            [left, right],
+            mapping,
+            start_pose=reference[0],
+            goal_xy=reference[-1, :2],
+            min_turning_radius=2.0,
+            max_curvature_rate=0.5,
+        )
+        self.assertTrue(result.success, result.failure_reason)
+        diagnostics = result.diagnostics[-1]
+        self.assertTrue(
+            diagnostics["transition_overlap_feasible"]
+        )
+        self.assertGreaterEqual(
+            diagnostics["transition_node_count"], 1
+        )
+        transitions = (
+            np.flatnonzero(
+                np.diff(result.path_to_corridor) != 0
+            )
+            + 1
+        )
+        self.assertGreaterEqual(len(transitions), 1)
+        for node_index in transitions:
+            point = result.poses[node_index, :2]
+            for corridor in (left, right):
+                A, b = corridor
+                self.assertGreaterEqual(
+                    float(np.min(b - A @ point)),
+                    -2e-5,
+                )
 
 
 if __name__ == "__main__":

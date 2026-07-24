@@ -9,6 +9,10 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -60,15 +64,25 @@ def append_jsonl(path: Path, value) -> None:
 
 
 def select_manifest_rows(
-    rows: list[dict], sample_count: int
+    rows: list[dict],
+    sample_count: int,
+    distance_layer: str | None = None,
 ) -> list[dict]:
-    if sample_count <= 0 or sample_count % len(LAYERS):
-        raise ValueError(
-            "sample_count must be a positive multiple of three"
-        )
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if distance_layer is not None:
+        layers = (distance_layer,)
+        per_layer = sample_count
+    else:
+        if sample_count % len(LAYERS):
+            raise ValueError(
+                "sample_count must be a multiple of three "
+                "when all distance layers are selected"
+            )
+        layers = LAYERS
+        per_layer = sample_count // len(LAYERS)
     selected = []
-    per_layer = sample_count // len(LAYERS)
-    for layer in LAYERS:
+    for layer in layers:
         layer_rows = [
             row for row in rows if row["distance_layer"] == layer
         ]
@@ -90,6 +104,90 @@ def select_manifest_rows(
     ):
         raise ValueError("manifest must use free goal heading")
     return selected
+
+
+def save_visualizations(
+    records: list[dict],
+    output_dir: Path,
+) -> None:
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    trial_index = np.arange(1, len(records) + 1)
+    labels = [record["trial_id"] for record in records]
+    hybrid_time = np.asarray(
+        [
+            record.get("hybrid_astar_time_s", np.nan)
+            for record in records
+        ],
+        dtype=np.float64,
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(15, 13),
+        constrained_layout=True,
+    )
+    axes[0].bar(trial_index, hybrid_time, color="#4c78a8")
+    axes[0].set_title("Hybrid A* runtime by trial")
+    axes[0].set_ylabel("Time (s)")
+    axes[0].grid(axis="y", alpha=0.3)
+
+    width = 0.25
+    colors = ("#4c78a8", "#f58518", "#54a24b")
+    for variant_index, ((variant, _), color) in enumerate(
+        zip(CORRIDOR_VARIANTS, colors)
+    ):
+        counts = np.asarray(
+            [
+                record.get(
+                    f"{variant}_corridor_count",
+                    np.nan,
+                )
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        offset = (variant_index - 1) * width
+        axes[1].bar(
+            trial_index + offset,
+            counts,
+            width=width,
+            label=variant,
+            color=color,
+        )
+    axes[1].set_title("Ordered GS safety-corridor count")
+    axes[1].set_ylabel("Corridor count")
+    axes[1].legend()
+    axes[1].grid(axis="y", alpha=0.3)
+
+    reduction = np.asarray(
+        [
+            100.0
+            * record.get(
+                "dense_to_merged_corridor_reduction_fraction",
+                np.nan,
+            )
+            for record in records
+        ],
+        dtype=np.float64,
+    )
+    axes[2].bar(trial_index, reduction, color="#e45756")
+    axes[2].axhline(0.0, color="black", linewidth=0.8)
+    axes[2].set_title(
+        "Dense to merged-curvature-run corridor reduction"
+    )
+    axes[2].set_ylabel("Reduction (%)")
+    axes[2].set_xlabel("Trial")
+    axes[2].grid(axis="y", alpha=0.3)
+    axes[2].set_xticks(trial_index)
+    axes[2].set_xticklabels(labels, rotation=60, ha="right")
+
+    fig.savefig(
+        figures_dir / "runtime_corridor_summary.png",
+        dpi=180,
+    )
+    plt.close(fig)
 
 
 def numeric_summary(records: list[dict], key: str):
@@ -155,6 +253,12 @@ def build_summary(records: list[dict], sample_count: int) -> dict:
         "sample_count": int(sample_count),
         "search_success_count": int(len(searched)),
         "search_failure_count": int(sample_count - len(searched)),
+        "search": {
+            "hybrid_astar_time_s": numeric_summary(
+                searched,
+                "hybrid_astar_time_s",
+            ),
+        },
         "simplification": {
             key: numeric_summary(searched, key)
             for key in (
@@ -232,6 +336,12 @@ def main() -> None:
         choices=sorted(SCENE_PRESETS),
     )
     parser.add_argument("--sample-count", type=int, default=3)
+    parser.add_argument(
+        "--distance-layer",
+        choices=("all", *LAYERS),
+        default="all",
+        help="Select all layers or sample only one distance layer.",
+    )
     parser.add_argument("--z-floor-scene", type=float, default=-0.15)
     parser.add_argument(
         "--robot-height-meters", type=float, default=0.10
@@ -265,7 +375,11 @@ def main() -> None:
     manifest = json.loads(
         args.selected_goals_json.read_text(encoding="utf-8")
     )
-    selected = select_manifest_rows(manifest, args.sample_count)
+    selected = select_manifest_rows(
+        manifest,
+        args.sample_count,
+        None if args.distance_layer == "all" else args.distance_layer,
+    )
     save_json(args.output_dir / "selected_goals.json", selected)
 
     device = torch.device(
@@ -475,6 +589,7 @@ def main() -> None:
                     args.selected_goals_json
                 ),
                 "sample_count": args.sample_count,
+                "distance_layer": args.distance_layer,
                 "goal_heading_mode": "free",
                 "stops_after": "ordered_GS_safety_corridor",
                 "trajectory_optimization_run": False,
@@ -489,6 +604,7 @@ def main() -> None:
         }
     )
     save_json(args.output_dir / "summary.json", summary)
+    save_visualizations(records, args.output_dir)
     print(json.dumps(summary, indent=2), flush=True)
 
 

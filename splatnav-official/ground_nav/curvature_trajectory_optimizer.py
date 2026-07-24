@@ -1,4 +1,4 @@
-"""Arc-length direct-collocation optimizer for forward ground trajectories."""
+"""Hermite-Simpson arc-length optimizer for forward ground trajectories."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ class TrajectoryResult:
     def summary(self) -> dict:
         return {
             "success": bool(self.success),
-            "collocation_method": "trapezoidal",
+            "collocation_method": "hermite_simpson",
             "node_count": int(len(self.poses)),
             "dense_pose_count": int(len(self.dense_poses)),
             "path_length": (
@@ -144,15 +144,15 @@ def _dynamics(state: np.ndarray, curvature_rate: float) -> np.ndarray:
     )
 
 
-def _trapezoidal_defects(
+def _hermite_simpson_midpoints(
     x: np.ndarray,
     y: np.ndarray,
     heading: np.ndarray,
     curvature: np.ndarray,
     curvature_rate: np.ndarray,
     lengths: np.ndarray,
-) -> np.ndarray:
-    """Return z[i+1] - z[i] - ds/2 * (f[i] + f[i+1])."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return Hermite midpoint states, rates, and dynamics."""
 
     states = np.column_stack([x, y, heading, curvature])
     derivatives = np.column_stack(
@@ -163,12 +163,63 @@ def _trapezoidal_defects(
             curvature_rate,
         ]
     )
+    midpoint_states = (
+        0.5 * (states[:-1] + states[1:])
+        + lengths[:, None]
+        * (derivatives[:-1] - derivatives[1:])
+        / 8.0
+    )
+    midpoint_rates = 0.5 * (
+        curvature_rate[:-1] + curvature_rate[1:]
+    )
+    midpoint_derivatives = np.column_stack(
+        [
+            np.cos(midpoint_states[:, 2]),
+            np.sin(midpoint_states[:, 2]),
+            midpoint_states[:, 3],
+            midpoint_rates,
+        ]
+    )
+    return midpoint_states, midpoint_rates, midpoint_derivatives
+
+
+def _hermite_simpson_defects(
+    x: np.ndarray,
+    y: np.ndarray,
+    heading: np.ndarray,
+    curvature: np.ndarray,
+    curvature_rate: np.ndarray,
+    lengths: np.ndarray,
+) -> np.ndarray:
+    """Return the four Hermite-Simpson defects per interval."""
+
+    states = np.column_stack([x, y, heading, curvature])
+    derivatives = np.column_stack(
+        [
+            np.cos(heading),
+            np.sin(heading),
+            curvature,
+            curvature_rate,
+        ]
+    )
+    _, _, midpoint_derivatives = _hermite_simpson_midpoints(
+        x,
+        y,
+        heading,
+        curvature,
+        curvature_rate,
+        lengths,
+    )
     return (
         states[1:]
         - states[:-1]
-        - 0.5
-        * lengths[:, None]
-        * (derivatives[:-1] + derivatives[1:])
+        - lengths[:, None]
+        * (
+            derivatives[:-1]
+            + 4.0 * midpoint_derivatives
+            + derivatives[1:]
+        )
+        / 6.0
     )
 
 
@@ -233,6 +284,25 @@ def _normalize_corridors(corridors) -> list[tuple[np.ndarray, np.ndarray]]:
     if not normalized:
         raise ValueError("at least one corridor is required")
     return normalized
+
+
+def _node_corridor_indices(
+    node_index: int,
+    node_mapping: np.ndarray,
+    segment_mapping: np.ndarray,
+) -> tuple[int, ...]:
+    """Return every corridor touching a collocation node.
+
+    At an ordered-corridor transition, the node is constrained to both
+    adjacent corridors, making it an optimized overlap witness.
+    """
+
+    indices = {int(node_mapping[node_index])}
+    if node_index > 0:
+        indices.add(int(segment_mapping[node_index - 1]))
+    if node_index < len(segment_mapping):
+        indices.add(int(segment_mapping[node_index]))
+    return tuple(sorted(indices))
 
 
 def _reference_arc_length(reference: np.ndarray) -> np.ndarray:
@@ -322,7 +392,7 @@ def _initial_curvature(
 
 
 class CurvatureTrajectoryOptimizer:
-    """Solve a corridor-constrained forward trajectory in the arc-length domain."""
+    """Solve a corridor-constrained Hermite-Simpson trajectory."""
 
     def __init__(self, config: TrajectoryOptimizerConfig | None = None) -> None:
         self.config = TrajectoryOptimizerConfig() if config is None else config
@@ -424,8 +494,33 @@ class CurvatureTrajectoryOptimizer:
                     y - reference_nodes[:, 1]
                 ) ** 2
                 heading_error = heading - reference_nodes[:, 2]
-                curvature_energy = 0.5 * np.sum(
-                    (curvature[:-1] ** 2 + curvature[1:] ** 2) * lengths
+                midpoint_states, midpoint_rates, _ = (
+                    _hermite_simpson_midpoints(
+                        x,
+                        y,
+                        heading,
+                        curvature,
+                        rate,
+                        lengths,
+                    )
+                )
+                curvature_energy = np.sum(
+                    lengths
+                    * (
+                        curvature[:-1] ** 2
+                        + 4.0 * midpoint_states[:, 3] ** 2
+                        + curvature[1:] ** 2
+                    )
+                    / 6.0
+                )
+                rate_energy = np.sum(
+                    lengths
+                    * (
+                        rate[:-1] ** 2
+                        + 4.0 * midpoint_rates**2
+                        + rate[1:] ** 2
+                    )
+                    / 6.0
                 )
                 return float(
                     length_weight * np.sum(lengths)
@@ -434,11 +529,7 @@ class CurvatureTrajectoryOptimizer:
                     * np.sum(heading_error**2)
                     + self.config.curvature_weight * curvature_energy
                     + self.config.curvature_rate_weight
-                    * 0.5
-                    * np.sum(
-                        (rate[:-1] ** 2 + rate[1:] ** 2)
-                        * lengths
-                    )
+                    * rate_energy
                     + self.config.terminal_heading_weight * heading_error[-1] ** 2
                 )
 
@@ -452,7 +543,7 @@ class CurvatureTrajectoryOptimizer:
                     y[-1] - goal[1],
                 ]
                 rows.extend(
-                    _trapezoidal_defects(
+                    _hermite_simpson_defects(
                         x,
                         y,
                         heading,
@@ -468,9 +559,15 @@ class CurvatureTrajectoryOptimizer:
                     layout.unpack(values)
                 )
                 rows = []
-                for index, corridor_index in enumerate(node_mapping):
-                    A, b = corridor_list[int(corridor_index)]
-                    rows.extend(b - A @ np.asarray([x[index], y[index]]))
+                for index in range(layout.nodes):
+                    point = np.asarray([x[index], y[index]])
+                    for corridor_index in _node_corridor_indices(
+                        index,
+                        node_mapping,
+                        segment_mapping,
+                    ):
+                        A, b = corridor_list[corridor_index]
+                        rows.extend(b - A @ point)
                 for index, corridor_index in enumerate(segment_mapping):
                     A, b = corridor_list[int(corridor_index)]
                     start_state = np.asarray(
@@ -495,6 +592,15 @@ class CurvatureTrajectoryOptimizer:
                     end_derivative = _dynamics(
                         end_state, rate[index + 1]
                     )
+                    midpoint_state = _hermite_state(
+                        start_state,
+                        end_state,
+                        start_derivative,
+                        end_derivative,
+                        lengths[index],
+                        0.5,
+                    )
+                    rows.extend(b - A @ midpoint_state[:2])
                     for sample in range(
                         1,
                         self.config.dense_samples_per_segment + 1,
@@ -554,7 +660,7 @@ class CurvatureTrajectoryOptimizer:
                 "solver_success": bool(solution.success),
                 "solver_status": int(solution.status),
                 "solver_message": str(solution.message),
-                "collocation_method": "trapezoidal",
+                "collocation_method": "hermite_simpson",
                 "iterations": int(solution.nit),
                 "objective": float(solution.fun),
                 "max_equality_error": equality_error,
@@ -568,6 +674,7 @@ class CurvatureTrajectoryOptimizer:
                 and equality_error <= self.config.constraint_tolerance
                 and minimum_margin >= -self.config.constraint_tolerance
                 and validation["dense_corridor_feasible"]
+                and validation["transition_overlap_feasible"]
                 and validation["curvature_feasible"]
                 and validation["curvature_rate_feasible"]
                 and validation["collocation_dynamics_feasible"]
@@ -688,7 +795,7 @@ class CurvatureTrajectoryOptimizer:
         collocation_defect = float(
             np.max(
                 np.abs(
-                    _trapezoidal_defects(
+                    _hermite_simpson_defects(
                         x,
                         y,
                         heading,
@@ -704,10 +811,38 @@ class CurvatureTrajectoryOptimizer:
             A, b = corridors[int(corridor_index)]
             margins.extend(b - A @ state[:2])
         minimum_dense_margin = float(np.min(margins))
+        transition_margins = []
+        transition_count = 0
+        for node_index in range(layout.nodes):
+            corridor_indices = _node_corridor_indices(
+                node_index,
+                node_mapping,
+                segment_mapping,
+            )
+            if len(corridor_indices) <= 1:
+                continue
+            transition_count += 1
+            point = np.asarray([x[node_index], y[node_index]])
+            for corridor_index in corridor_indices:
+                A, b = corridors[corridor_index]
+                transition_margins.extend(b - A @ point)
+        minimum_transition_margin = (
+            float(np.min(transition_margins))
+            if transition_margins
+            else None
+        )
         tolerance = self.config.constraint_tolerance
         return {
             "dense_corridor_feasible": minimum_dense_margin >= -tolerance,
             "minimum_dense_corridor_margin": minimum_dense_margin,
+            "transition_overlap_feasible": (
+                minimum_transition_margin is None
+                or minimum_transition_margin >= -tolerance
+            ),
+            "minimum_transition_overlap_margin": (
+                minimum_transition_margin
+            ),
+            "transition_node_count": int(transition_count),
             "curvature_feasible": bool(
                 max(
                     np.max(np.abs(curvature)),

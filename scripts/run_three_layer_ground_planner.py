@@ -147,7 +147,7 @@ def save_visualizations(
             label="Hybrid A* dense path",
         )
     if result.simplification is not None:
-        path = result.simplification.merged_poses_scene
+        path = result.simplification.boundary_poses_scene
         axis.plot(
             path[:, 0],
             path[:, 1],
@@ -155,7 +155,7 @@ def save_visualizations(
             color="#F58518",
             markersize=3.0,
             linewidth=1.0,
-            label="Merged primitive path",
+            label="Motion-primitive boundaries",
         )
     if len(result.dense_output_poses_scene):
         path = result.dense_output_poses_scene
@@ -517,9 +517,11 @@ def main() -> None:
         "mainline": (
             "3D Gaussian Splat -> height-band planar ellipses -> "
             "ellipse-distance GroundGrid -> forward-only Hybrid A* -> "
-            "ordered GS corridor -> arc-length direct collocation -> "
+            "motion-primitive boundaries -> ordered GS corridor -> "
+            "Hermite-Simpson arc-length direct collocation -> "
             "curvature, curvature-rate, and corridor verification"
         ),
+        "corridor_reference": "motion_primitive_boundaries",
         "status": result.status(),
         "output_kind": output_kind,
         "visualizations": visualizations,
