@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import heapq
 import math
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -101,6 +102,7 @@ class HybridPath:
     analytic_expansion_used: bool
     goal_heading_constrained: bool
     config: dict
+    diagnostics: dict = field(default_factory=dict)
 
     @property
     def xy(self) -> np.ndarray:
@@ -125,6 +127,7 @@ class HybridPath:
             "analytic_expansion_used": bool(self.analytic_expansion_used),
             "goal_heading_constrained": bool(self.goal_heading_constrained),
             "terminal_yaw_rad": float(self.poses_scene[-1, 2]),
+            "diagnostics": dict(self.diagnostics),
             "config": dict(self.config),
         }
 
@@ -191,6 +194,33 @@ class HybridAStarPlanner:
         self.straight_index = int(
             np.argmin(np.abs(np.asarray(self.config.curvature_fractions)))
         )
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self) -> None:
+        self._diagnostics = {
+            "collision_check_count": 0,
+            "collision_check_time_s": 0.0,
+            "motion_collision_check_count": 0,
+            "motion_collision_check_time_s": 0.0,
+            "goal_cost_map_time_s": 0.0,
+            "heuristic_call_count": 0,
+            "heuristic_time_s": 0.0,
+            "open_list_max_length": 0,
+            "analytic_expansion_attempt_count": 0,
+            "analytic_expansion_success_count": 0,
+            "analytic_expansion_time_s": 0.0,
+            "dubins_connection_attempt_count": 0,
+            "dubins_connection_success_count": 0,
+            "dubins_connection_time_s": 0.0,
+            "dubins_solver_call_count": 0,
+            "dubins_solver_time_s": 0.0,
+            "dubins_path_candidate_count": 0,
+            "free_heading_candidate_count": 0,
+        }
+
+    @property
+    def last_diagnostics(self) -> dict:
+        return dict(self._diagnostics)
 
     def _point_index(self, point: Sequence[float]) -> tuple[int, int] | None:
         point_array = np.asarray(point, dtype=np.float64).reshape(2)
@@ -216,8 +246,17 @@ class HybridAStarPlanner:
         return index[0], index[1], self._heading_index(state[2])
 
     def _state_is_free(self, state: np.ndarray) -> bool:
-        index = self._point_index(state[:2])
-        return index is not None and not bool(self.occupied[index])
+        begin = time.perf_counter()
+        try:
+            index = self._point_index(state[:2])
+            return index is not None and not bool(
+                self.occupied[index]
+            )
+        finally:
+            self._diagnostics["collision_check_count"] += 1
+            self._diagnostics["collision_check_time_s"] += (
+                time.perf_counter() - begin
+            )
 
     @staticmethod
     def _integrate(
@@ -246,20 +285,52 @@ class HybridAStarPlanner:
         *,
         collision_check: bool = True,
     ) -> np.ndarray | None:
-        if distance_scene < -1e-12:
-            raise ValueError("forward motion distance must be non-negative")
-        if distance_scene <= 1e-12:
-            return np.asarray([state], dtype=np.float64)
-        count = max(1, int(math.ceil(distance_scene / self.collision_step_scene)))
-        distances = np.linspace(
-            distance_scene / count, distance_scene, count, dtype=np.float64
-        )
-        samples = np.stack(
-            [self._integrate(state, curvature_scene, value) for value in distances]
-        )
-        if collision_check and any(not self._state_is_free(sample) for sample in samples):
-            return None
-        return samples
+        begin = time.perf_counter()
+        if collision_check:
+            self._diagnostics[
+                "motion_collision_check_count"
+            ] += 1
+        try:
+            if distance_scene < -1e-12:
+                raise ValueError(
+                    "forward motion distance must be non-negative"
+                )
+            if distance_scene <= 1e-12:
+                return np.asarray([state], dtype=np.float64)
+            count = max(
+                1,
+                int(
+                    math.ceil(
+                        distance_scene
+                        / self.collision_step_scene
+                    )
+                ),
+            )
+            distances = np.linspace(
+                distance_scene / count,
+                distance_scene,
+                count,
+                dtype=np.float64,
+            )
+            samples = np.stack(
+                [
+                    self._integrate(
+                        state, curvature_scene, value
+                    )
+                    for value in distances
+                ]
+            )
+            if collision_check and any(
+                not self._state_is_free(sample)
+                for sample in samples
+            ):
+                return None
+            return samples
+        finally:
+            if collision_check:
+                self._diagnostics[
+                    "motion_collision_check_time_s"
+                ] += (time.perf_counter() - begin)
 
     def _goal_cost_map(self, goal_index: tuple[int, int]) -> np.ndarray:
         costs = np.full(self.shape, np.inf, dtype=np.float64)
@@ -414,6 +485,30 @@ class HybridAStarPlanner:
         goal: np.ndarray,
         *,
         validate_endpoint: bool = False,
+    ) -> tuple[
+        tuple[str, str, str],
+        tuple[float, float, float],
+        float,
+    ] | None:
+        begin = time.perf_counter()
+        self._diagnostics["dubins_solver_call_count"] += 1
+        try:
+            return self._dubins_shortest_impl(
+                start,
+                goal,
+                validate_endpoint=validate_endpoint,
+            )
+        finally:
+            self._diagnostics["dubins_solver_time_s"] += (
+                time.perf_counter() - begin
+            )
+
+    def _dubins_shortest_impl(
+        self,
+        start: np.ndarray,
+        goal: np.ndarray,
+        *,
+        validate_endpoint: bool = False,
     ) -> tuple[tuple[str, str, str], tuple[float, float, float], float] | None:
         dx, dy = goal[:2] - start[:2]
         distance_scene = math.hypot(float(dx), float(dy))
@@ -422,6 +517,9 @@ class HybridAStarPlanner:
         alpha = self._mod2pi(float(start[2]) - direction)
         beta = self._mod2pi(float(goal[2]) - direction)
         candidates = self._dubins_parameters(alpha, beta, normalized_distance)
+        self._diagnostics["dubins_path_candidate_count"] += (
+            len(candidates)
+        )
         if not validate_endpoint:
             if not candidates:
                 return None
@@ -451,6 +549,25 @@ class HybridAStarPlanner:
         return path_types, lengths, normalized_total * self.turning_radius_scene
 
     def _analytic_expansion(
+        self, state: np.ndarray, goal: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+        begin = time.perf_counter()
+        self._diagnostics[
+            "dubins_connection_attempt_count"
+        ] += 1
+        try:
+            result = self._analytic_expansion_impl(state, goal)
+            if result is not None:
+                self._diagnostics[
+                    "dubins_connection_success_count"
+                ] += 1
+            return result
+        finally:
+            self._diagnostics["dubins_connection_time_s"] += (
+                time.perf_counter() - begin
+            )
+
+    def _analytic_expansion_impl(
         self, state: np.ndarray, goal: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
         solution = self._dubins_shortest(
@@ -507,6 +624,9 @@ class HybridAStarPlanner:
                 continue
             seen.add(key)
             unique_headings.append(wrap_angle(float(heading)))
+        self._diagnostics["free_heading_candidate_count"] += (
+            len(unique_headings)
+        )
 
         candidates = []
         for heading in unique_headings:
@@ -529,6 +649,23 @@ class HybridAStarPlanner:
         return None
 
     def _heuristic_m(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        goal_cost_scene: np.ndarray,
+    ) -> float:
+        begin = time.perf_counter()
+        self._diagnostics["heuristic_call_count"] += 1
+        try:
+            return self._heuristic_m_impl(
+                state, goal, goal_cost_scene
+            )
+        finally:
+            self._diagnostics["heuristic_time_s"] += (
+                time.perf_counter() - begin
+            )
+
+    def _heuristic_m_impl(
         self,
         state: np.ndarray,
         goal: np.ndarray,
@@ -641,6 +778,7 @@ class HybridAStarPlanner:
             analytic_expansion_used=True,
             goal_heading_constrained=goal_heading_constrained,
             config={**asdict(self.config), "scene_scale": self.scene_scale},
+            diagnostics=dict(self._diagnostics),
         )
 
     def plan(
@@ -650,6 +788,7 @@ class HybridAStarPlanner:
     ) -> HybridPath:
         """Return a path to a goal pose or to a goal position with free yaw."""
 
+        self._reset_diagnostics()
         start = Pose2D.from_value(start_pose).as_array()
         if isinstance(goal_pose, Pose2D):
             goal = goal_pose.as_array()
@@ -680,7 +819,11 @@ class HybridAStarPlanner:
         if self.occupied[goal_index]:
             raise ValueError("goal pose lies in an occupied ground-grid cell")
 
+        begin = time.perf_counter()
         goal_cost_scene = self._goal_cost_map(goal_index)
+        self._diagnostics["goal_cost_map_time_s"] = (
+            time.perf_counter() - begin
+        )
         if not np.isfinite(goal_cost_scene[start_index]):
             raise RuntimeError("start and goal are disconnected in the projected ground grid")
 
@@ -700,6 +843,7 @@ class HybridAStarPlanner:
         best_record_ids = {start_key: 0}
         start_h = self._heuristic_m(start, goal, goal_cost_scene)
         queue = [(start_h, 0.0, 0, start_key, 0)]
+        self._diagnostics["open_list_max_length"] = 1
         serial = 0
         expanded_nodes = 0
         generated_nodes = 1
@@ -723,6 +867,10 @@ class HybridAStarPlanner:
                 or distance_to_goal <= analytic_distance_scene
             )
             if should_try_analytic:
+                self._diagnostics[
+                    "analytic_expansion_attempt_count"
+                ] += 1
+                begin = time.perf_counter()
                 analytic = (
                     self._analytic_expansion(record.state, goal)
                     if goal_heading_constrained
@@ -731,7 +879,22 @@ class HybridAStarPlanner:
                         goal[:2],
                     )
                 )
+                self._diagnostics[
+                    "analytic_expansion_time_s"
+                ] += (time.perf_counter() - begin)
                 if analytic is not None:
+                    self._diagnostics[
+                        "analytic_expansion_success_count"
+                    ] += 1
+                    self._diagnostics["expanded_nodes"] = (
+                        expanded_nodes
+                    )
+                    self._diagnostics["generated_nodes"] = (
+                        generated_nodes
+                    )
+                    self._diagnostics[
+                        "open_list_final_length"
+                    ] = len(queue)
                     return self._reconstruct(
                         records,
                         record_id,
@@ -796,7 +959,14 @@ class HybridAStarPlanner:
                         child_record_id,
                     ),
                 )
+                self._diagnostics["open_list_max_length"] = max(
+                    self._diagnostics["open_list_max_length"],
+                    len(queue),
+                )
 
+        self._diagnostics["expanded_nodes"] = expanded_nodes
+        self._diagnostics["generated_nodes"] = generated_nodes
+        self._diagnostics["open_list_final_length"] = len(queue)
         if expanded_nodes >= self.config.max_expansions:
             raise RuntimeError(
                 f"Hybrid A* exceeded max_expansions={self.config.max_expansions}"

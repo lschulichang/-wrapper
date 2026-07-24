@@ -68,6 +68,35 @@ class HybridAStarTest(unittest.TestCase):
         self.assertAlmostEqual(result.arc_lengths_m[0], 0.0)
         self.assertAlmostEqual(result.arc_lengths_m[-1], 10.0)
         self.assertTrue(np.all(np.diff(result.arc_lengths_m) > 0.0))
+        diagnostics = result.diagnostics
+        self.assertGreater(
+            diagnostics["collision_check_count"], 0
+        )
+        self.assertGreater(
+            diagnostics["motion_collision_check_count"], 0
+        )
+        self.assertGreaterEqual(
+            diagnostics["open_list_max_length"], 1
+        )
+        self.assertGreaterEqual(
+            diagnostics["analytic_expansion_attempt_count"], 1
+        )
+        self.assertEqual(
+            diagnostics["analytic_expansion_success_count"], 1
+        )
+        self.assertGreaterEqual(
+            diagnostics["dubins_connection_attempt_count"],
+            diagnostics["dubins_connection_success_count"],
+        )
+        self.assertEqual(
+            diagnostics["dubins_connection_success_count"], 1
+        )
+        self.assertGreater(
+            diagnostics["dubins_solver_call_count"], 0
+        )
+        self.assertEqual(
+            planner.last_diagnostics, diagnostics
+        )
 
     def test_quarter_turn_respects_minimum_radius(self):
         planner = HybridAStarPlanner(FakeGrid(), 1.0, self.config())
