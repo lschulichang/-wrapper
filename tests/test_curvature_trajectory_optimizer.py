@@ -53,11 +53,23 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
         np.testing.assert_allclose(result.poses[-1, :2], [5.0, 0.0], atol=2e-5)
         self.assertLessEqual(np.max(np.abs(result.curvature)), 0.95 / 2.0 + 2e-5)
         self.assertLessEqual(np.max(np.abs(result.curvature_rate)), 0.5 + 2e-5)
+        self.assertEqual(
+            len(result.curvature_rate), len(result.curvature)
+        )
         self.assertTrue(np.all(np.diff(result.arc_length) > 0.0))
         self.assertEqual(len(result.path_to_corridor), len(result.poses))
         self.assertTrue(np.all(np.diff(result.path_to_corridor) >= 0))
         self.assertTrue(result.diagnostics[-1]["dense_corridor_feasible"])
+        self.assertTrue(
+            result.diagnostics[-1][
+                "collocation_dynamics_feasible"
+            ]
+        )
         self.assertTrue(result.diagnostics[-1]["dense_dynamics_feasible"])
+        self.assertEqual(
+            result.summary()["collocation_method"],
+            "trapezoidal",
+        )
 
     def test_curvature_is_continuous_under_rate_control(self):
         x = np.linspace(0.0, 3.0, 9)
@@ -75,7 +87,59 @@ class CurvatureTrajectoryOptimizerTest(unittest.TestCase):
         segment_lengths = np.diff(result.arc_length)
         np.testing.assert_allclose(
             np.diff(result.curvature),
-            result.curvature_rate * segment_lengths,
+            0.5
+            * (
+                result.curvature_rate[:-1]
+                + result.curvature_rate[1:]
+            )
+            * segment_lengths,
+            atol=3e-5,
+        )
+
+    def test_all_trapezoidal_collocation_equations(self):
+        radius = 4.0
+        angle = np.linspace(0.0, np.pi / 4.0, 13)
+        reference = np.column_stack(
+            [
+                radius * np.sin(angle),
+                radius * (1.0 - np.cos(angle)),
+                angle,
+            ]
+        )
+        result = self.optimizer().optimize(
+            reference,
+            [rectangular_corridor(-0.5, 4.0, -0.5, 2.0)],
+            np.zeros(len(reference), dtype=int),
+            start_pose=reference[0],
+            goal_xy=reference[-1, :2],
+            min_turning_radius=2.5,
+            max_curvature_rate=0.5,
+        )
+        self.assertTrue(result.success, result.failure_reason)
+        x = result.poses[:, 0]
+        y = result.poses[:, 1]
+        heading = np.unwrap(result.poses[:, 2])
+        curvature = result.curvature
+        rate = result.curvature_rate
+        ds = np.diff(result.arc_length)
+        np.testing.assert_allclose(
+            np.diff(x),
+            0.5 * ds * (np.cos(heading[:-1]) + np.cos(heading[1:])),
+            atol=3e-5,
+        )
+        np.testing.assert_allclose(
+            np.diff(y),
+            0.5 * ds * (np.sin(heading[:-1]) + np.sin(heading[1:])),
+            atol=3e-5,
+        )
+        np.testing.assert_allclose(
+            np.diff(heading),
+            0.5 * ds * (curvature[:-1] + curvature[1:]),
+            atol=3e-5,
+        )
+        np.testing.assert_allclose(
+            np.diff(curvature),
+            0.5 * ds * (rate[:-1] + rate[1:]),
             atol=3e-5,
         )
 

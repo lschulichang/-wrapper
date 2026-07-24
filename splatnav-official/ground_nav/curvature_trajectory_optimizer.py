@@ -25,7 +25,7 @@ def _as_numpy(value) -> np.ndarray:
 class TrajectoryOptimizerConfig:
     """Numerical and objective settings for arc-length collocation."""
 
-    node_count: int = 32
+    node_count: int = 12
     curvature_margin: float = 0.95
     length_weight: float = 0.10
     reference_position_weight: float = 10.0
@@ -83,6 +83,7 @@ class TrajectoryResult:
     def summary(self) -> dict:
         return {
             "success": bool(self.success),
+            "collocation_method": "trapezoidal",
             "node_count": int(len(self.poses)),
             "dense_pose_count": int(len(self.dense_poses)),
             "path_length": (
@@ -115,7 +116,7 @@ class _Layout:
 
     @property
     def size(self) -> int:
-        return 4 * self.nodes + 2 * self.segments
+        return 5 * self.nodes + self.segments
 
     def pack(self, x, y, heading, curvature, curvature_rate, lengths):
         return np.concatenate([x, y, heading, curvature, curvature_rate, lengths])
@@ -126,8 +127,8 @@ class _Layout:
         y = values[n : 2 * n]
         heading = values[2 * n : 3 * n]
         curvature = values[3 * n : 4 * n]
-        curvature_rate = values[4 * n : 4 * n + m]
-        lengths = values[4 * n + m : 4 * n + 2 * m]
+        curvature_rate = values[4 * n : 5 * n]
+        lengths = values[5 * n : 5 * n + m]
         return x, y, heading, curvature, curvature_rate, lengths
 
 
@@ -143,21 +144,80 @@ def _dynamics(state: np.ndarray, curvature_rate: float) -> np.ndarray:
     )
 
 
-def _integrate_constant_rate(
-    state: np.ndarray,
-    curvature_rate: float,
-    distance: float,
-    steps: int,
+def _trapezoidal_defects(
+    x: np.ndarray,
+    y: np.ndarray,
+    heading: np.ndarray,
+    curvature: np.ndarray,
+    curvature_rate: np.ndarray,
+    lengths: np.ndarray,
 ) -> np.ndarray:
-    current = np.asarray(state, dtype=np.float64).copy()
-    step = float(distance) / int(steps)
-    for _ in range(int(steps)):
-        k1 = _dynamics(current, curvature_rate)
-        k2 = _dynamics(current + 0.5 * step * k1, curvature_rate)
-        k3 = _dynamics(current + 0.5 * step * k2, curvature_rate)
-        k4 = _dynamics(current + step * k3, curvature_rate)
-        current = current + (step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    return current
+    """Return z[i+1] - z[i] - ds/2 * (f[i] + f[i+1])."""
+
+    states = np.column_stack([x, y, heading, curvature])
+    derivatives = np.column_stack(
+        [
+            np.cos(heading),
+            np.sin(heading),
+            curvature,
+            curvature_rate,
+        ]
+    )
+    return (
+        states[1:]
+        - states[:-1]
+        - 0.5
+        * lengths[:, None]
+        * (derivatives[:-1] + derivatives[1:])
+    )
+
+
+def _hermite_state(
+    start: np.ndarray,
+    end: np.ndarray,
+    start_derivative: np.ndarray,
+    end_derivative: np.ndarray,
+    length: float,
+    fraction: float,
+) -> np.ndarray:
+    """Interpolate a collocation interval for dense safety checks."""
+
+    tau = float(fraction)
+    tau2 = tau * tau
+    tau3 = tau2 * tau
+    h00 = 2.0 * tau3 - 3.0 * tau2 + 1.0
+    h10 = tau3 - 2.0 * tau2 + tau
+    h01 = -2.0 * tau3 + 3.0 * tau2
+    h11 = tau3 - tau2
+    return (
+        h00 * start
+        + h10 * float(length) * start_derivative
+        + h01 * end
+        + h11 * float(length) * end_derivative
+    )
+
+
+def _hermite_derivative(
+    start: np.ndarray,
+    end: np.ndarray,
+    start_derivative: np.ndarray,
+    end_derivative: np.ndarray,
+    length: float,
+    fraction: float,
+) -> np.ndarray:
+    """Differentiate the Hermite interpolant with respect to arc length."""
+
+    tau = float(fraction)
+    tau2 = tau * tau
+    dh00 = 6.0 * tau2 - 6.0 * tau
+    dh10 = 3.0 * tau2 - 4.0 * tau + 1.0
+    dh01 = -6.0 * tau2 + 6.0 * tau
+    dh11 = 3.0 * tau2 - 2.0 * tau
+    return (
+        (dh00 * start + dh01 * end) / float(length)
+        + dh10 * start_derivative
+        + dh11 * end_derivative
+    )
 
 
 def _normalize_corridors(corridors) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -245,7 +305,19 @@ def _initial_curvature(
                 curvature[index + 1] - delta,
                 curvature[index + 1] + delta,
             )
-    curvature_rate = np.diff(curvature) / lengths
+    segment_rate = np.diff(curvature) / lengths
+    curvature_rate = np.empty(len(curvature), dtype=np.float64)
+    curvature_rate[0] = segment_rate[0]
+    curvature_rate[-1] = segment_rate[-1]
+    if len(curvature_rate) > 2:
+        curvature_rate[1:-1] = 0.5 * (
+            segment_rate[:-1] + segment_rate[1:]
+        )
+    curvature_rate = np.clip(
+        curvature_rate,
+        -curvature_rate_limit,
+        curvature_rate_limit,
+    )
     return curvature, curvature_rate
 
 
@@ -336,10 +408,12 @@ class CurvatureTrajectoryOptimizer:
             n, m = layout.nodes, layout.segments
             lower[3 * n : 4 * n] = -curvature_limit
             upper[3 * n : 4 * n] = curvature_limit
-            lower[4 * n : 4 * n + m] = -rate_limit
-            upper[4 * n : 4 * n + m] = rate_limit
-            lower[4 * n + m :] = np.maximum(1e-4, 0.25 * reference_lengths)
-            upper[4 * n + m :] = 2.0 * reference_lengths
+            lower[4 * n : 5 * n] = -rate_limit
+            upper[4 * n : 5 * n] = rate_limit
+            lower[5 * n :] = np.maximum(
+                1e-4, 0.25 * reference_lengths
+            )
+            upper[5 * n :] = 2.0 * reference_lengths
 
             length_weight = self.config.length_weight * (0.5**attempt)
             reference_weight = self.config.reference_position_weight * (1.5**attempt)
@@ -360,7 +434,11 @@ class CurvatureTrajectoryOptimizer:
                     * np.sum(heading_error**2)
                     + self.config.curvature_weight * curvature_energy
                     + self.config.curvature_rate_weight
-                    * np.sum(rate**2 * lengths)
+                    * 0.5
+                    * np.sum(
+                        (rate[:-1] ** 2 + rate[1:] ** 2)
+                        * lengths
+                    )
                     + self.config.terminal_heading_weight * heading_error[-1] ** 2
                 )
 
@@ -373,14 +451,37 @@ class CurvatureTrajectoryOptimizer:
                     x[-1] - goal[0],
                     y[-1] - goal[1],
                 ]
-                for index in range(m):
-                    state = np.asarray(
-                        [x[index], y[index], heading[index], curvature[index]]
+                rows.extend(
+                    _trapezoidal_defects(
+                        x,
+                        y,
+                        heading,
+                        curvature,
+                        rate,
+                        lengths,
+                    ).reshape(-1)
+                )
+                return np.asarray(rows, dtype=np.float64)
+
+            def inequality(values):
+                x, y, heading, curvature, rate, lengths = (
+                    layout.unpack(values)
+                )
+                rows = []
+                for index, corridor_index in enumerate(node_mapping):
+                    A, b = corridor_list[int(corridor_index)]
+                    rows.extend(b - A @ np.asarray([x[index], y[index]]))
+                for index, corridor_index in enumerate(segment_mapping):
+                    A, b = corridor_list[int(corridor_index)]
+                    start_state = np.asarray(
+                        [
+                            x[index],
+                            y[index],
+                            heading[index],
+                            curvature[index],
+                        ]
                     )
-                    predicted = _integrate_constant_rate(
-                        state, rate[index], lengths[index], steps=4
-                    )
-                    following = np.asarray(
+                    end_state = np.asarray(
                         [
                             x[index + 1],
                             y[index + 1],
@@ -388,21 +489,29 @@ class CurvatureTrajectoryOptimizer:
                             curvature[index + 1],
                         ]
                     )
-                    rows.extend(following - predicted)
-                return np.asarray(rows, dtype=np.float64)
-
-            def inequality(values):
-                x, y, _, _, _, _ = layout.unpack(values)
-                rows = []
-                for index, corridor_index in enumerate(node_mapping):
-                    A, b = corridor_list[int(corridor_index)]
-                    rows.extend(b - A @ np.asarray([x[index], y[index]]))
-                for index, corridor_index in enumerate(segment_mapping):
-                    A, b = corridor_list[int(corridor_index)]
-                    midpoint = np.asarray(
-                        [0.5 * (x[index] + x[index + 1]), 0.5 * (y[index] + y[index + 1])]
+                    start_derivative = _dynamics(
+                        start_state, rate[index]
                     )
-                    rows.extend(b - A @ midpoint)
+                    end_derivative = _dynamics(
+                        end_state, rate[index + 1]
+                    )
+                    for sample in range(
+                        1,
+                        self.config.dense_samples_per_segment + 1,
+                    ):
+                        fraction = (
+                            sample
+                            / self.config.dense_samples_per_segment
+                        )
+                        dense_state = _hermite_state(
+                            start_state,
+                            end_state,
+                            start_derivative,
+                            end_derivative,
+                            lengths[index],
+                            fraction,
+                        )
+                        rows.extend(b - A @ dense_state[:2])
                 return np.asarray(rows, dtype=np.float64)
 
             solution = minimize(
@@ -445,6 +554,7 @@ class CurvatureTrajectoryOptimizer:
                 "solver_success": bool(solution.success),
                 "solver_status": int(solution.status),
                 "solver_message": str(solution.message),
+                "collocation_method": "trapezoidal",
                 "iterations": int(solution.nit),
                 "objective": float(solution.fun),
                 "max_equality_error": equality_error,
@@ -460,7 +570,7 @@ class CurvatureTrajectoryOptimizer:
                 and validation["dense_corridor_feasible"]
                 and validation["curvature_feasible"]
                 and validation["curvature_rate_feasible"]
-                and validation["dense_dynamics_feasible"]
+                and validation["collocation_dynamics_feasible"]
             )
             if feasible:
                 return self._result_from_candidate(
@@ -497,31 +607,66 @@ class CurvatureTrajectoryOptimizer:
         dense_states = [np.asarray([x[0], y[0], heading[0], curvature[0]])]
         dense_arc = [0.0]
         dense_mapping = [int(segment_mapping[0])]
-        endpoint_errors = []
+        dynamics_residuals = []
         cumulative = 0.0
         for index in range(layout.segments):
             start = np.asarray([x[index], y[index], heading[index], curvature[index]])
+            end = np.asarray(
+                [
+                    x[index + 1],
+                    y[index + 1],
+                    heading[index + 1],
+                    curvature[index + 1],
+                ]
+            )
+            start_derivative = _dynamics(start, rate[index])
+            end_derivative = _dynamics(end, rate[index + 1])
             for sample in range(1, self.config.dense_samples_per_segment + 1):
-                distance = lengths[index] * sample / self.config.dense_samples_per_segment
-                state = _integrate_constant_rate(
+                fraction = (
+                    sample / self.config.dense_samples_per_segment
+                )
+                distance = lengths[index] * fraction
+                state = _hermite_state(
                     start,
-                    rate[index],
-                    distance,
-                    steps=max(1, sample),
+                    end,
+                    start_derivative,
+                    end_derivative,
+                    lengths[index],
+                    fraction,
+                )
+                derivative = _hermite_derivative(
+                    start,
+                    end,
+                    start_derivative,
+                    end_derivative,
+                    lengths[index],
+                    fraction,
+                )
+                interpolated_rate = (
+                    (1.0 - fraction) * rate[index]
+                    + fraction * rate[index + 1]
+                )
+                dynamics_residuals.append(
+                    float(
+                        np.max(
+                            np.abs(
+                                derivative
+                                - _dynamics(
+                                    state, interpolated_rate
+                                )
+                            )
+                        )
+                    )
                 )
                 dense_states.append(state)
                 dense_arc.append(cumulative + distance)
                 dense_mapping.append(int(segment_mapping[index]))
-            expected = np.asarray(
-                [x[index + 1], y[index + 1], heading[index + 1], curvature[index + 1]]
-            )
-            endpoint_errors.append(float(np.max(np.abs(dense_states[-1] - expected))))
             cumulative += lengths[index]
         return (
             np.asarray(dense_states),
             np.asarray(dense_arc),
             np.asarray(dense_mapping, dtype=np.int64),
-            max(endpoint_errors, default=0.0),
+            max(dynamics_residuals, default=0.0),
         )
 
     def _validate_candidate(
@@ -534,9 +679,25 @@ class CurvatureTrajectoryOptimizer:
         curvature_limit,
         rate_limit,
     ) -> dict:
-        _, _, _, curvature, rate, _ = layout.unpack(values)
-        dense, _, dense_mapping, dense_error = self._dense_rollout(
+        x, y, heading, curvature, rate, lengths = layout.unpack(
+            values
+        )
+        dense, _, dense_mapping, dense_residual = self._dense_rollout(
             values, layout, segment_mapping
+        )
+        collocation_defect = float(
+            np.max(
+                np.abs(
+                    _trapezoidal_defects(
+                        x,
+                        y,
+                        heading,
+                        curvature,
+                        rate,
+                        lengths,
+                    )
+                )
+            )
         )
         margins = []
         for state, corridor_index in zip(dense, dense_mapping):
@@ -548,13 +709,24 @@ class CurvatureTrajectoryOptimizer:
             "dense_corridor_feasible": minimum_dense_margin >= -tolerance,
             "minimum_dense_corridor_margin": minimum_dense_margin,
             "curvature_feasible": bool(
-                np.max(np.abs(curvature)) <= curvature_limit + tolerance
+                max(
+                    np.max(np.abs(curvature)),
+                    np.max(np.abs(dense[:, 3])),
+                )
+                <= curvature_limit + tolerance
             ),
             "curvature_rate_feasible": bool(
                 np.max(np.abs(rate)) <= rate_limit + tolerance
             ),
-            "dense_dynamics_feasible": dense_error <= 5.0 * tolerance,
-            "max_dense_dynamics_error": dense_error,
+            "collocation_dynamics_feasible": (
+                collocation_defect <= tolerance
+            ),
+            # Kept as a compatibility alias for existing reports.
+            "dense_dynamics_feasible": (
+                collocation_defect <= tolerance
+            ),
+            "max_collocation_defect": collocation_defect,
+            "max_dense_dynamics_residual": dense_residual,
         }
 
     def _result_from_candidate(

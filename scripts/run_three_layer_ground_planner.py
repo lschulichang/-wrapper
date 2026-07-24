@@ -9,8 +9,13 @@ import sys
 import time
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import torch
+
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +61,238 @@ def save_json(path: Path, value) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def halfspace_polygon(A, b, tolerance=1e-8):
+    """Return ordered vertices of a bounded 2D half-space polygon."""
+
+    A = np.asarray(A, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    vertices = []
+    for left in range(len(b)):
+        for right in range(left + 1, len(b)):
+            matrix = np.stack([A[left], A[right]])
+            determinant = float(np.linalg.det(matrix))
+            if abs(determinant) <= 1e-12:
+                continue
+            point = np.linalg.solve(
+                matrix, np.asarray([b[left], b[right]])
+            )
+            if np.all(A @ point <= b + tolerance):
+                vertices.append(point)
+    if len(vertices) < 3:
+        return None
+    unique = np.unique(
+        np.round(np.asarray(vertices), decimals=12), axis=0
+    )
+    if len(unique) < 3:
+        return None
+    center = np.mean(unique, axis=0)
+    angles = np.arctan2(
+        unique[:, 1] - center[1],
+        unique[:, 0] - center[0],
+    )
+    return unique[np.argsort(angles)]
+
+
+def save_visualizations(
+    output_dir: Path,
+    result,
+    curvature_limit: float,
+    curvature_rate_limit: float,
+) -> list[str]:
+    """Save standard figures for every three-layer experiment."""
+
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    generated = []
+
+    figure, axis = plt.subplots(figsize=(9.0, 7.0))
+    if result.corridor is not None:
+        for index, (A, b) in enumerate(
+            result.corridor.corridors
+        ):
+            polygon = halfspace_polygon(
+                np.asarray(A.detach().cpu()),
+                np.asarray(b.detach().cpu()),
+            )
+            if polygon is None:
+                continue
+            axis.fill(
+                polygon[:, 0],
+                polygon[:, 1],
+                color="#4C78A8",
+                alpha=0.10,
+                label=(
+                    "GS safety corridors"
+                    if index == 0
+                    else None
+                ),
+            )
+            axis.plot(
+                np.r_[polygon[:, 0], polygon[0, 0]],
+                np.r_[polygon[:, 1], polygon[0, 1]],
+                color="#4C78A8",
+                alpha=0.35,
+                linewidth=0.8,
+            )
+    if result.hybrid_path is not None:
+        path = result.hybrid_path.poses_scene
+        axis.plot(
+            path[:, 0],
+            path[:, 1],
+            linestyle="--",
+            color="#7F7F7F",
+            linewidth=1.1,
+            label="Hybrid A* dense path",
+        )
+    if result.simplification is not None:
+        path = result.simplification.merged_poses_scene
+        axis.plot(
+            path[:, 0],
+            path[:, 1],
+            "o-",
+            color="#F58518",
+            markersize=3.0,
+            linewidth=1.0,
+            label="Merged primitive path",
+        )
+    if len(result.dense_output_poses_scene):
+        path = result.dense_output_poses_scene
+        axis.plot(
+            path[:, 0],
+            path[:, 1],
+            color="#E45756",
+            linewidth=2.0,
+            label=(
+                "Optimized trajectory"
+                if result.success
+                else "Hybrid fallback"
+            ),
+        )
+        axis.scatter(
+            path[0, 0],
+            path[0, 1],
+            marker="o",
+            s=55,
+            color="#54A24B",
+            label="Start",
+            zorder=5,
+        )
+        axis.scatter(
+            path[-1, 0],
+            path[-1, 1],
+            marker="*",
+            s=95,
+            color="#B279A2",
+            label="Goal",
+            zorder=5,
+        )
+    axis.set_title(
+        "Three-layer ground planning"
+        + (" — success" if result.success else " — fallback")
+    )
+    axis.set_xlabel("Scene x")
+    axis.set_ylabel("Scene y")
+    axis.set_aspect("equal", adjustable="box")
+    axis.grid(True, alpha=0.25)
+    axis.legend(loc="best", fontsize=8)
+    figure.tight_layout()
+    overview_path = figure_dir / "planning_overview.png"
+    figure.savefig(overview_path, dpi=180)
+    plt.close(figure)
+    generated.append(str(overview_path.relative_to(output_dir)))
+
+    if result.trajectory_m is not None:
+        trajectory = result.trajectory_m
+        figure, axes = plt.subplots(
+            2, 1, figsize=(9.0, 6.5), sharex=True
+        )
+        axes[0].plot(
+            trajectory.arc_length,
+            trajectory.curvature,
+            color="#4C78A8",
+            linewidth=1.8,
+        )
+        axes[0].axhline(
+            curvature_limit,
+            color="#E45756",
+            linestyle="--",
+            linewidth=1.0,
+            label="limits",
+        )
+        axes[0].axhline(
+            -curvature_limit,
+            color="#E45756",
+            linestyle="--",
+            linewidth=1.0,
+        )
+        axes[0].set_ylabel(r"$\kappa$ (m$^{-1}$)")
+        axes[0].grid(True, alpha=0.25)
+        axes[0].legend(loc="best")
+        axes[1].plot(
+            trajectory.arc_length,
+            trajectory.curvature_rate,
+            color="#F58518",
+            linewidth=1.8,
+        )
+        axes[1].axhline(
+            curvature_rate_limit,
+            color="#E45756",
+            linestyle="--",
+            linewidth=1.0,
+            label="limits",
+        )
+        axes[1].axhline(
+            -curvature_rate_limit,
+            color="#E45756",
+            linestyle="--",
+            linewidth=1.0,
+        )
+        axes[1].set_xlabel("Arc length s (m)")
+        axes[1].set_ylabel(r"$\sigma$ (m$^{-2}$)")
+        axes[1].grid(True, alpha=0.25)
+        axes[1].legend(loc="best")
+        figure.suptitle(
+            "Curvature and curvature-rate profiles"
+        )
+        figure.tight_layout()
+        profile_path = (
+            figure_dir / "curvature_profiles.png"
+        )
+        figure.savefig(profile_path, dpi=180)
+        plt.close(figure)
+        generated.append(
+            str(profile_path.relative_to(output_dir))
+        )
+
+    figure, axis = plt.subplots(figsize=(8.5, 4.8))
+    timing_names = list(result.timings)
+    timing_values = [
+        float(result.timings[name]) for name in timing_names
+    ]
+    labels = [
+        name.removesuffix("_s").replace("_", " ")
+        for name in timing_names
+    ]
+    bars = axis.barh(
+        labels, timing_values, color="#72B7B2"
+    )
+    axis.bar_label(
+        bars,
+        labels=[f"{value:.3f} s" for value in timing_values],
+        padding=3,
+        fontsize=8,
+    )
+    axis.set_xlabel("Wall-clock time (s)")
+    axis.set_title("Planning stage timing")
+    axis.grid(True, axis="x", alpha=0.25)
+    figure.tight_layout()
+    timing_path = figure_dir / "stage_timings.png"
+    figure.savefig(timing_path, dpi=180)
+    plt.close(figure)
+    generated.append(str(timing_path.relative_to(output_dir)))
+    return generated
 
 
 def main() -> None:
@@ -107,7 +344,7 @@ def main() -> None:
         "--hybrid-max-expansions", type=int, default=200_000
     )
     parser.add_argument(
-        "--optimizer-nodes", type=int, default=32
+        "--optimizer-nodes", type=int, default=12
     )
     parser.add_argument(
         "--optimizer-max-iterations", type=int, default=500
@@ -249,6 +486,32 @@ def main() -> None:
             args.output_dir / "optimized_path_poses_m.npy",
             result.trajectory_m.dense_poses,
         )
+        np.save(
+            args.output_dir / "collocation_poses_m.npy",
+            result.trajectory_m.poses,
+        )
+        np.save(
+            args.output_dir / "collocation_arc_length_m.npy",
+            result.trajectory_m.arc_length,
+        )
+        np.save(
+            args.output_dir / "collocation_curvature_1pm.npy",
+            result.trajectory_m.curvature,
+        )
+        np.save(
+            args.output_dir
+            / "collocation_curvature_rate_1pm2.npy",
+            result.trajectory_m.curvature_rate,
+        )
+    curvature_limit = (
+        0.95 / args.min_turning_radius_meters
+    )
+    visualizations = save_visualizations(
+        args.output_dir,
+        result,
+        curvature_limit=curvature_limit,
+        curvature_rate_limit=args.max_curvature_rate_1pm2,
+    )
 
     report = {
         "mainline": (
@@ -259,6 +522,7 @@ def main() -> None:
         ),
         "status": result.status(),
         "output_kind": output_kind,
+        "visualizations": visualizations,
         "scene": args.scene,
         "device": str(device),
         "scene_scale": scale,
@@ -270,6 +534,11 @@ def main() -> None:
             None
             if result.hybrid_path is None
             else result.hybrid_path.summary()
+        ),
+        "simplification": (
+            None
+            if result.simplification is None
+            else result.simplification.summary()
         ),
         "corridor": (
             None
@@ -297,7 +566,7 @@ def main() -> None:
                 args.min_turning_radius_meters
             ),
             "curvature_limit_1pm": (
-                0.95 / args.min_turning_radius_meters
+                curvature_limit
             ),
             "max_curvature_rate_1pm2": (
                 args.max_curvature_rate_1pm2
