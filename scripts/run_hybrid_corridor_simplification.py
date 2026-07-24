@@ -158,6 +158,7 @@ def build_summary(records: list[dict], sample_count: int) -> dict:
         "simplification": {
             key: numeric_summary(searched, key)
             for key in (
+                "primitive_simplification_time_s",
                 "dense_pose_count",
                 "primitive_count",
                 "primitive_boundary_pose_count",
@@ -369,11 +370,15 @@ def main() -> None:
                 time.perf_counter() - begin
             )
             record["search_success"] = True
+            begin = time.perf_counter()
             simplification = simplify_hybrid_path_by_primitives(
                 hybrid_path,
                 curvature_tolerance_1pm=(
                     args.curvature_tolerance_1pm
                 ),
+            )
+            record["primitive_simplification_time_s"] = (
+                time.perf_counter() - begin
             )
             record.update(simplification.summary())
             paths = {
